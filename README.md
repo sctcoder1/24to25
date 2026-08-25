@@ -16,7 +16,9 @@ Microsoft requires Windows 11 24H2 build **26100.5074** (KB5064081) or a later c
 
 ## Sophos Live Action deployment
 
-Run the following as a **CMD** command in Sophos Live Action. It is pinned to the immutable reviewed script commit and verifies the file before execution:
+Copy the command from [`Sophos-Live-Action-One-Liner.txt`](Sophos-Live-Action-One-Liner.txt) and run it as a **CMD** command in Sophos Live Action. It downloads the pinned `Upgrade-25H2.ps1`, verifies the file, creates the SYSTEM startup and three-hour retry tasks in Windows Task Scheduler, and starts the first scheduled run immediately.
+
+The same command is shown here for reference:
 
 ```cmd
 powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop';$d='C:\ProgramData\Win11-25H2';$p=Join-Path $d 'Upgrade-25H2.ps1';New-Item -ItemType Directory -Path $d -Force|Out-Null;[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/sctcoder1/24to25/4f3ae43ccb13181ae400742ced1cf05e7c7441c5/Upgrade-25H2.ps1' -OutFile $p;if((Get-FileHash -Algorithm SHA256 $p).Hash -ne '5F1ECDAEE09F5074EE0D51EEA08C2AB16997B95AAF2E126D065FF520FF385189'){Remove-Item -LiteralPath $p -Force;throw 'Upgrade script SHA256 mismatch'};& $p -Install"
