@@ -29,6 +29,7 @@ function Get-OsInfo {
     $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
     [pscustomobject]@{
         ProductName    = [string]$cv.ProductName
+        InstallationType = [string]$cv.InstallationType
         DisplayVersion = [string]$cv.DisplayVersion
         CurrentBuild   = [int]$cv.CurrentBuild
         UBR            = [int]$cv.UBR
@@ -145,9 +146,11 @@ if (-not $mutex.WaitOne(0)) {
 try {
     if (-not (Test-IsSystem)) { throw 'Upgrade execution must run as LocalSystem (SYSTEM).' }
     $os = Get-OsInfo
-    Write-Log "Detected $($os.ProductName), version $($os.DisplayVersion), build $($os.CurrentBuild).$($os.UBR)."
+    Write-Log "Detected registry product '$($os.ProductName)', installation type $($os.InstallationType), version $($os.DisplayVersion), build $($os.CurrentBuild).$($os.UBR)."
 
-    if ($os.ProductName -notlike '*Windows 11*') { throw 'This script only supports Windows 11.' }
+    # Windows 11 can retain the legacy registry ProductName "Windows 10 Pro".
+    # InstallationType plus the release/build is authoritative for this workflow.
+    if ($os.InstallationType -ne 'Client') { throw "Out of scope: installation type '$($os.InstallationType)' is not a Windows client." }
     if ($os.DisplayVersion -eq '25H2' -and $os.CurrentBuild -ge 26200) {
         Save-State -Phase 'Complete' -Detail "Verified Windows 11 25H2 build $($os.CurrentBuild).$($os.UBR)"
         Write-Log 'Windows 11 25H2 is verified. Upgrade workflow is complete.'
