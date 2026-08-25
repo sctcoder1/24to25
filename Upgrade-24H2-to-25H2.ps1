@@ -1,138 +1,280 @@
+#requires -version 5.1
+
 $ErrorActionPreference = 'Stop'
 
-$LogDir  = 'C:\ProgramData\Win11-25H2'
-$LogFile = Join-Path $LogDir 'Upgrade-Test.log'
+# ============================================================
+# Windows 11 24H2 -> 25H2 Self-Healing Upgrade
+# ============================================================
 
-New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+$BaseDir     = 'C:\ProgramData\Win11-25H2'
+$ScriptPath  = Join-Path $BaseDir 'Upgrade-24H2-to-25H2.ps1'
+$LogFile     = Join-Path $BaseDir 'Upgrade.log'
+
+$StartupTask = 'Win11-25H2-Startup'
+$RetryTask   = 'Win11-25H2-Retry'
+
+$MinimumUBR  = 5074
+
+New-Item -ItemType Directory -Path $BaseDir -Force | Out-Null
+
+
+# ============================================================
+# Logging
+# ============================================================
 
 function Write-Log {
     param([string]$Message)
 
     $Line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $Message"
-    Add-Content -Path $LogFile -Value $Line
+
+    try {
+        Add-Content -Path $LogFile -Value $Line
+    }
+    catch {}
+
     Write-Host $Line
 }
 
-function Show-RebootPrompt {
-    Add-Type -AssemblyName PresentationFramework
 
-    $Result = [System.Windows.MessageBox]::Show(
-        "Windows 11 25H2 has been installed and requires a restart.`n`nWould you like to restart this computer now?",
-        "Windows 11 25H2 Upgrade",
-        [System.Windows.MessageBoxButton]::YesNo,
-        [System.Windows.MessageBoxImage]::Information
-    )
+# ============================================================
+# Determine if this process is running interactively
+# ============================================================
 
-    if ($Result -eq [System.Windows.MessageBoxResult]::Yes) {
-        Write-Log 'User chose to restart now.'
-        shutdown.exe /r /t 0
+function Test-InteractiveSession {
+
+    try {
+        $Process = Get-Process -Id $PID
+        return ($Process.SessionId -ne 0)
     }
-    else {
-        Write-Log 'User chose to restart later.'
+    catch {
+        return $false
     }
 }
 
-try {
 
-    # Must be administrator
-    $Identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $Principal = New-Object Security.Principal.WindowsPrincipal($Identity)
+# ============================================================
+# Notify / Prompt User For Reboot
+# ============================================================
 
-    if (-not $Principal.IsInRole(
-        [Security.Principal.WindowsBuiltInRole]::Administrator
-    )) {
-        throw 'This script must be run as Administrator.'
-    }
+function Request-Reboot {
 
-    $CV = Get-ItemProperty `
-        'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
-
-    Write-Log "Detected Windows version $($CV.DisplayVersion), build $($CV.CurrentBuild).$($CV.UBR)"
-
-    if ($CV.DisplayVersion -eq '25H2') {
-        Write-Log 'Windows 11 25H2 is already installed.'
-        Write-Host ''
-        Write-Host '25H2 is already installed.' -ForegroundColor Green
-        exit 0
-    }
-
-    if ($CV.DisplayVersion -ne '24H2') {
-        throw "This test only supports Windows 11 24H2. Detected $($CV.DisplayVersion)."
-    }
-
-    if ([int]$CV.CurrentBuild -ne 26100) {
-        throw "Unexpected Windows build $($CV.CurrentBuild). Expected Windows 11 24H2 build 26100."
-    }
-
-    if ([int]$CV.UBR -lt 5074) {
-        throw "The machine is below the minimum 25H2 prerequisite build. Current build is 26100.$($CV.UBR); 26100.5074 or newer is required."
-    }
-
-    Write-Log 'Creating Windows Update session.'
-
-    $Session = New-Object -ComObject Microsoft.Update.Session
-    $Session.ClientApplicationID = 'Manual Win11 25H2 Upgrade Test'
-
-    $Searcher = $Session.CreateUpdateSearcher()
-
-    # 2 = Microsoft's public Windows Update service
-    $Searcher.ServerSelection = 2
-
-    Write-Log 'Searching Microsoft Windows Update directly for applicable software updates.'
-
-    $SearchResult = $Searcher.Search(
-        "IsInstalled=0 and Type='Software' and IsHidden=0"
+    param(
+        [string]$Reason
     )
 
-    Write-Log "Windows Update returned $($SearchResult.Updates.Count) applicable software update(s)."
+    Write-Log "Restart required: $Reason"
 
-    $Target = $null
+    # --------------------------------------------------------
+    # If manually running in logged-in user's session,
+    # give them an actual Yes / No dialog.
+    # --------------------------------------------------------
 
-    for ($i = 0; $i -lt $SearchResult.Updates.Count; $i++) {
+    if (Test-InteractiveSession) {
 
-        $Update = $SearchResult.Updates.Item($i)
+        try {
 
-        Write-Log "Found: $($Update.Title)"
+            Add-Type -AssemblyName PresentationFramework
 
-        if ($Update.Title -match '^Windows 11, version 25H2') {
-            $Target = $Update
-            break
+            $Message = @"
+Windows needs to restart to continue the Windows 11 25H2 upgrade.
+
+$Reason
+
+Would you like to restart now?
+
+If you choose No, you can restart later. The upgrade will automatically continue after the computer restarts.
+"@
+
+            $Result = [System.Windows.MessageBox]::Show(
+                $Message,
+                'Windows 11 25H2 Upgrade',
+                [System.Windows.MessageBoxButton]::YesNo,
+                [System.Windows.MessageBoxImage]::Information
+            )
+
+            if ($Result -eq [System.Windows.MessageBoxResult]::Yes) {
+
+                Write-Log 'User chose to restart now.'
+
+                shutdown.exe /r /t 60 /d p:2:4 /c `
+                    "Windows 11 upgrade is continuing. This computer will restart in 60 seconds."
+
+                return
+            }
+
+            Write-Log 'User chose to restart later.'
+            return
+        }
+        catch {
+            Write-Log "Interactive reboot prompt failed: $($_.Exception.Message)"
         }
     }
 
-    if ($null -eq $Target) {
-        throw 'Windows 11, version 25H2 was not offered by Microsoft Windows Update.'
+
+    # --------------------------------------------------------
+    # SYSTEM tasks run in Session 0 and cannot display normal
+    # MessageBox UI directly.
+    #
+    # msg.exe can display to the currently logged-in session.
+    # --------------------------------------------------------
+
+    try {
+
+        $Message = @"
+Windows needs to restart to continue the Windows 11 25H2 upgrade.
+
+$Reason
+
+Please save your work and restart this computer when convenient.
+
+The upgrade will automatically continue after the restart.
+"@
+
+        & msg.exe * $Message
+
+        Write-Log 'Sent restart notification to logged-in user.'
+    }
+    catch {
+
+        Write-Log "Could not notify logged-in user: $($_.Exception.Message)"
+    }
+}
+
+
+# ============================================================
+# Pending Reboot Detection
+# ============================================================
+
+function Test-PendingReboot {
+
+    $Checks = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+    )
+
+    foreach ($Check in $Checks) {
+
+        if (Test-Path $Check) {
+            return $true
+        }
     }
 
-    Write-Log "Selected update: $($Target.Title)"
+    try {
 
-    if (-not $Target.EulaAccepted) {
-        Write-Log 'Accepting update license agreement.'
-        $Target.AcceptEula()
+        $PendingRename = Get-ItemProperty `
+            'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' `
+            -Name PendingFileRenameOperations `
+            -ErrorAction SilentlyContinue
+
+        if ($PendingRename.PendingFileRenameOperations) {
+            return $true
+        }
+    }
+    catch {}
+
+    return $false
+}
+
+
+# ============================================================
+# Scheduled Tasks
+# ============================================================
+
+function Install-SelfHealingTasks {
+
+    Write-Log 'Ensuring self-healing scheduled tasks exist.'
+
+    $TaskCommand = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$ScriptPath`""
+
+    # Startup task
+    & schtasks.exe /Create `
+        /TN $StartupTask `
+        /SC ONSTART `
+        /DELAY 0001:00 `
+        /RU SYSTEM `
+        /RL HIGHEST `
+        /TR $TaskCommand `
+        /F | Out-Null
+
+    # Retry every 3 hours
+    & schtasks.exe /Create `
+        /TN $RetryTask `
+        /SC HOURLY `
+        /MO 3 `
+        /RU SYSTEM `
+        /RL HIGHEST `
+        /TR $TaskCommand `
+        /F | Out-Null
+
+    Write-Log 'Startup and 3-hour retry tasks are installed.'
+}
+
+
+function Remove-SelfHealingTasks {
+
+    Write-Log 'Removing upgrade scheduled tasks.'
+
+    & schtasks.exe /Delete /TN $StartupTask /F 2>$null | Out-Null
+    & schtasks.exe /Delete /TN $RetryTask /F 2>$null | Out-Null
+}
+
+
+# ============================================================
+# Install One Windows Update
+# ============================================================
+
+function Install-WindowsUpdate {
+
+    param(
+        [Parameter(Mandatory)]
+        $Update,
+
+        [Parameter(Mandatory)]
+        $Session
+    )
+
+    Write-Log "Selected update: $($Update.Title)"
+
+    if (-not $Update.EulaAccepted) {
+
+        Write-Log 'Accepting update EULA.'
+        $Update.AcceptEula()
     }
 
-    $Updates = New-Object -ComObject Microsoft.Update.UpdateColl
-    [void]$Updates.Add($Target)
+    $Collection = New-Object -ComObject Microsoft.Update.UpdateColl
 
-    Write-Log 'Starting silent 25H2 download.'
+    [void]$Collection.Add($Update)
+
+    # --------------------------------------------------------
+    # Download
+    # --------------------------------------------------------
+
+    Write-Log 'Starting download.'
 
     $Downloader = $Session.CreateUpdateDownloader()
-    $Downloader.Updates = $Updates
+    $Downloader.Updates = $Collection
 
     $DownloadResult = $Downloader.Download()
 
     Write-Log "Download result code: $($DownloadResult.ResultCode)"
 
-    # WUA result code 2 = succeeded
-    if ($DownloadResult.ResultCode -ne 2) {
-        throw "25H2 download failed. Windows Update result code: $($DownloadResult.ResultCode)"
+    # 2 = Succeeded
+    # 3 = Succeeded with errors
+
+    if ($DownloadResult.ResultCode -notin 2,3) {
+
+        throw "Update download failed with result code $($DownloadResult.ResultCode)"
     }
 
-    Write-Log 'Download completed successfully.'
-    Write-Log 'Starting silent 25H2 installation.'
+    # --------------------------------------------------------
+    # Install
+    # --------------------------------------------------------
+
+    Write-Log 'Starting silent installation.'
 
     $Installer = $Session.CreateUpdateInstaller()
-    $Installer.Updates = $Updates
+
+    $Installer.Updates = $Collection
     $Installer.ForceQuiet = $true
 
     $InstallResult = $Installer.Install()
@@ -140,33 +282,366 @@ try {
     Write-Log "Install result code: $($InstallResult.ResultCode)"
     Write-Log "Reboot required: $($InstallResult.RebootRequired)"
 
-    # 2 = succeeded, 3 = succeeded with errors
     if ($InstallResult.ResultCode -notin 2,3) {
-        throw "25H2 installation failed. Windows Update result code: $($InstallResult.ResultCode)"
+
+        throw "Update installation failed with result code $($InstallResult.ResultCode)"
     }
 
-    Write-Host ''
-    Write-Host 'Windows 11 25H2 installation completed.' -ForegroundColor Green
+    return $InstallResult
+}
 
-    if ($InstallResult.RebootRequired) {
-        Write-Log '25H2 installation completed and Windows reports a restart is required.'
-        Show-RebootPrompt
+
+# ============================================================
+# Begin
+# ============================================================
+
+$Mutex = $null
+
+try {
+
+    # --------------------------------------------------------
+    # Prevent simultaneous runs
+    # --------------------------------------------------------
+
+    $Mutex = New-Object System.Threading.Mutex(
+        $false,
+        'Global\Win11_24H2_to_25H2_Upgrade'
+    )
+
+    if (-not $Mutex.WaitOne(0, $false)) {
+
+        Write-Log 'Another upgrade process is already running. Exiting.'
+        exit 0
     }
-    else {
-        Write-Log 'Installation completed and Windows did not report a required restart.'
+
+
+    Write-Log '================================================='
+    Write-Log 'Windows 11 25H2 upgrade process starting.'
+    Write-Log '================================================='
+
+
+    # --------------------------------------------------------
+    # Must be Administrator / SYSTEM
+    # --------------------------------------------------------
+
+    $Identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+
+    $Principal = New-Object `
+        Security.Principal.WindowsPrincipal($Identity)
+
+    if (-not $Principal.IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator
+    )) {
+
+        throw 'Script must be run as Administrator.'
     }
+
+
+    # --------------------------------------------------------
+    # Copy ourselves into ProgramData
+    # --------------------------------------------------------
+
+    $CurrentScript = $MyInvocation.MyCommand.Path
+
+    if ($CurrentScript -and
+        ((Resolve-Path $CurrentScript).Path -ne $ScriptPath)) {
+
+        Write-Log "Copying script to $ScriptPath"
+
+        Copy-Item `
+            -Path $CurrentScript `
+            -Destination $ScriptPath `
+            -Force
+    }
+
+
+    # --------------------------------------------------------
+    # Install persistence immediately
+    # --------------------------------------------------------
+
+    Install-SelfHealingTasks
+
+
+    # --------------------------------------------------------
+    # Read Windows version
+    # --------------------------------------------------------
+
+    $CV = Get-ItemProperty `
+        'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+
+    $Version = $CV.DisplayVersion
+    $Build   = [int]$CV.CurrentBuild
+    $UBR     = [int]$CV.UBR
+
+    Write-Log "Detected Windows $Version build $Build.$UBR"
+
+
+    # ========================================================
+    # SUCCESS
+    # ========================================================
+
+    if ($Version -eq '25H2') {
+
+        Write-Log 'SUCCESS: Windows 11 25H2 detected.'
+
+        Remove-SelfHealingTasks
+
+        Write-Log 'Upgrade lifecycle completed successfully.'
+
+        exit 0
+    }
+
+
+    # ========================================================
+    # Safety check
+    # ========================================================
+
+    if ($Version -ne '24H2') {
+
+        Write-Log "Unsupported Windows release detected: $Version"
+        Write-Log 'Automatic upgrade stopped.'
+
+        # Keep tasks so transient detection issues can retry,
+        # but do not attempt to modify another release.
+
+        exit 10
+    }
+
+
+    if ($Build -ne 26100) {
+
+        Write-Log "Unexpected 24H2 build number: $Build"
+        exit 11
+    }
+
+
+    # ========================================================
+    # Pending reboot
+    # ========================================================
+
+    if (Test-PendingReboot) {
+
+        Write-Log 'A pending Windows reboot was detected.'
+
+        Request-Reboot `
+            'Windows has already installed updates that must finish during a restart.'
+
+        exit 3010
+    }
+
+
+    # ========================================================
+    # Create Windows Update session
+    # ========================================================
+
+    Write-Log 'Creating Microsoft Windows Update session.'
+
+    $Session = New-Object -ComObject Microsoft.Update.Session
+
+    $Session.ClientApplicationID = `
+        'Windows 11 24H2 to 25H2 Upgrade'
+
+    $Searcher = $Session.CreateUpdateSearcher()
+
+
+    # 2 = Microsoft's public Windows Update service
+    # Bypasses configured WSUS search source.
+    $Searcher.ServerSelection = 2
+
+
+    # ========================================================
+    # PREREQUISITE CU
+    # ========================================================
+
+    if ($UBR -lt $MinimumUBR) {
+
+        Write-Log `
+            "Current build 26100.$UBR is below required 26100.$MinimumUBR."
+
+        Write-Log `
+            'Searching Microsoft Update for an applicable Windows 11 24H2 cumulative update.'
+
+        $Result = $Searcher.Search(
+            "IsInstalled=0 and Type='Software' and IsHidden=0"
+        )
+
+        Write-Log `
+            "Microsoft Update returned $($Result.Updates.Count) applicable update(s)."
+
+        $CU = $null
+
+        for ($i = 0; $i -lt $Result.Updates.Count; $i++) {
+
+            $Update = $Result.Updates.Item($i)
+
+            Write-Log "Available: $($Update.Title)"
+
+            if (
+                $Update.Title -match `
+                    'Cumulative Update for Windows 11 Version 24H2' `
+                -and
+                $Update.Title -notmatch 'Preview' `
+                -and
+                $Update.Title -notmatch '\.NET'
+            ) {
+
+                $CU = $Update
+                break
+            }
+        }
+
+
+        if ($null -eq $CU) {
+
+            throw `
+                'No applicable non-preview Windows 11 24H2 cumulative update was offered by Microsoft Update.'
+        }
+
+
+        Write-Log `
+            "Installing prerequisite cumulative update: $($CU.Title)"
+
+        $InstallResult = Install-WindowsUpdate `
+            -Update $CU `
+            -Session $Session
+
+
+        # A cumulative update will normally require this reboot.
+
+        if ($InstallResult.RebootRequired -or
+            (Test-PendingReboot)) {
+
+            Write-Log `
+                'Prerequisite cumulative update installed successfully.'
+
+            Request-Reboot `
+                'A Windows 11 prerequisite update was installed. Windows must restart before the 25H2 upgrade can continue.'
+
+            exit 3010
+        }
+
+
+        # Refresh version data in unusual case no reboot required.
+
+        $CV = Get-ItemProperty `
+            'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+
+        $UBR = [int]$CV.UBR
+
+        Write-Log "Build after prerequisite update: 26100.$UBR"
+
+        if ($UBR -lt $MinimumUBR) {
+
+            Write-Log `
+                'Build still below prerequisite level. A restart is likely required.'
+
+            Request-Reboot `
+                'Windows installed prerequisite updates and needs to restart before continuing.'
+
+            exit 3010
+        }
+    }
+
+
+    # ========================================================
+    # SEARCH FOR 25H2
+    # ========================================================
+
+    Write-Log `
+        'Prerequisite build requirement satisfied.'
+
+    Write-Log `
+        'Searching Microsoft Windows Update for Windows 11, version 25H2.'
+
+    $Result = $Searcher.Search(
+        "IsInstalled=0 and Type='Software' and IsHidden=0"
+    )
+
+    Write-Log `
+        "Microsoft Update returned $($Result.Updates.Count) applicable update(s)."
+
+    $FeatureUpdate = $null
+
+    for ($i = 0; $i -lt $Result.Updates.Count; $i++) {
+
+        $Update = $Result.Updates.Item($i)
+
+        Write-Log "Available: $($Update.Title)"
+
+        if ($Update.Title -match '^Windows 11, version 25H2') {
+
+            $FeatureUpdate = $Update
+            break
+        }
+    }
+
+
+    # ========================================================
+    # 25H2 not currently offered
+    # ========================================================
+
+    if ($null -eq $FeatureUpdate) {
+
+        Write-Log `
+            'Windows 11, version 25H2 is not currently being offered by Microsoft Update.'
+
+        Write-Log `
+            'No changes made. The automatic retry task will try again in 3 hours.'
+
+        exit 30
+    }
+
+
+    # ========================================================
+    # INSTALL 25H2
+    # ========================================================
+
+    Write-Log `
+        "Installing feature update: $($FeatureUpdate.Title)"
+
+    $InstallResult = Install-WindowsUpdate `
+        -Update $FeatureUpdate `
+        -Session $Session
+
+
+    if ($InstallResult.RebootRequired -or
+        (Test-PendingReboot)) {
+
+        Write-Log `
+            'Windows 11 25H2 installation completed and requires restart.'
+
+        Request-Reboot `
+            'Windows 11 25H2 has been installed. Restart Windows to complete the upgrade.'
+
+        exit 3010
+    }
+
+
+    Write-Log `
+        '25H2 installation completed without Windows reporting an immediate reboot requirement.'
+
+    Write-Log `
+        'The script will verify the installed version during the next scheduled run.'
 
 }
 catch {
 
     Write-Log "ERROR: $($_.Exception.Message)"
 
-    Write-Host ''
-    Write-Host 'Upgrade failed.' -ForegroundColor Red
-    Write-Host $_.Exception.Message -ForegroundColor Red
-    Write-Host ''
-    Write-Host "Log: $LogFile"
+    Write-Log `
+        'The upgrade tasks have been left in place and will retry automatically.'
 
-    Read-Host 'Press Enter to close'
-    exit 1
+    exit 99
+}
+finally {
+
+    if ($Mutex) {
+
+        try {
+            $Mutex.ReleaseMutex()
+        }
+        catch {}
+
+        $Mutex.Dispose()
+    }
 }
