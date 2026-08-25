@@ -21,7 +21,7 @@ Copy the command from [`Sophos-Live-Action-One-Liner.txt`](Sophos-Live-Action-On
 The same command is shown here for reference:
 
 ```cmd
-powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop';$d='C:\ProgramData\Win11-25H2';$p=Join-Path $d 'Upgrade-25H2.ps1';New-Item -ItemType Directory -Path $d -Force|Out-Null;[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/sctcoder1/24to25/4f3ae43ccb13181ae400742ced1cf05e7c7441c5/Upgrade-25H2.ps1' -OutFile $p;if((Get-FileHash -Algorithm SHA256 $p).Hash -ne '5F1ECDAEE09F5074EE0D51EEA08C2AB16997B95AAF2E126D065FF520FF385189'){Remove-Item -LiteralPath $p -Force;throw 'Upgrade script SHA256 mismatch'};& $p -Install"
+powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop';$d='C:\ProgramData\Win11-25H2';$p=Join-Path $d 'Upgrade-25H2.ps1';New-Item -ItemType Directory -Path $d -Force|Out-Null;[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/sctcoder1/24to25/2564f9e05f03c8bb1b54a4f24c7440c91bc413fe/Upgrade-25H2.ps1' -OutFile $p;if((Get-FileHash -Algorithm SHA256 $p).Hash -ne 'FE151F18A4E29927CB42A33533F56DE34FAF222D19F70642B433A671DF51E416'){Remove-Item -LiteralPath $p -Force;throw 'Upgrade script SHA256 mismatch'};& $p -Install"
 ```
 
 The one-liner downloads only the file at a pinned commit, verifies its SHA256 before execution, installs the scheduled tasks, and starts the first run. Do not use a `main` branch URL for production deployment.
@@ -40,6 +40,7 @@ Successful completion is recorded as `Complete` in `state.json`. The two tasks s
 
 ## Operational notes
 
+- Windows 11 may retain a legacy `ProductName` registry value such as `Windows 10 Pro`. The script therefore validates the client installation type, release, and build instead of relying on that misleading label.
 - A device must be able to reach Microsoft Update endpoints. Policies that prohibit dual scan or public Microsoft Update access can prevent this workflow from scanning; failures remain logged and retry automatically.
 - Microsoft may withhold 25H2 because of a safeguard hold. This script does not bypass compatibility safeguards.
 - The restart command uses Windows' native scheduled-restart notification plus `msg.exe` for a clear 60-minute warning to logged-on users.
