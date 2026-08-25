@@ -7,7 +7,8 @@ Microsoft requires Windows 11 24H2 build **26100.5074** (KB5064081) or a later c
 ## Behavior
 
 - Targets only Windows 11 24H2 (build 26100). Other operating systems and releases exit without modification.
-- Creates two highest-privilege `SYSTEM` tasks: one at startup and one every three hours (also started immediately).
+- Uses a small BAT launcher, following the proven Sophos Live Action pattern: Sophos only downloads files, creates two highest-privilege `SYSTEM` tasks with `schtasks.exe`, starts one, and exits immediately.
+- The two tasks run at startup and every three hours; both launch the BAT, which runs the PowerShell workflow outside the Sophos Live Action process.
 - Uses both task-level `IgnoreNew` handling and a global mutex to prevent overlapping runs.
 - Keeps the script, state, and append-only log in `C:\ProgramData\Win11-25H2`.
 - Never restarts immediately. When a restart is needed, it warns all interactive users and schedules the restart for 60 minutes later.
@@ -16,12 +17,12 @@ Microsoft requires Windows 11 24H2 build **26100.5074** (KB5064081) or a later c
 
 ## Sophos Live Action deployment
 
-Copy the command from [`Sophos-Live-Action-One-Liner.txt`](Sophos-Live-Action-One-Liner.txt) and run it as a **CMD** command in Sophos Live Action. It downloads the pinned `Upgrade-25H2.ps1`, verifies the file, creates the SYSTEM startup and three-hour retry tasks in Windows Task Scheduler, and starts the first scheduled run immediately.
+Copy the command from [`Sophos-Live-Action-One-Liner.txt`](Sophos-Live-Action-One-Liner.txt) and run it as a **CMD** command in Sophos Live Action. It downloads the pinned [`Upgrade-25H2.ps1`](Upgrade-25H2.ps1) and [`Win11-25H2-Launcher.bat`](Win11-25H2-Launcher.bat), verifies both files, creates the SYSTEM startup and three-hour retry tasks with `schtasks.exe`, starts the first task, and then returns control to Sophos immediately.
 
 The same command is shown here for reference:
 
 ```cmd
-powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop';$d='C:\ProgramData\Win11-25H2';$p=Join-Path $d 'Upgrade-25H2.ps1';New-Item -ItemType Directory -Path $d -Force|Out-Null;[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/sctcoder1/24to25/2564f9e05f03c8bb1b54a4f24c7440c91bc413fe/Upgrade-25H2.ps1' -OutFile $p;if((Get-FileHash -Algorithm SHA256 $p).Hash -ne 'FE151F18A4E29927CB42A33533F56DE34FAF222D19F70642B433A671DF51E416'){Remove-Item -LiteralPath $p -Force;throw 'Upgrade script SHA256 mismatch'};& $p -Install"
+powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop';$r='C:\ProgramData\Win11-25H2';$ps=Join-Path $r 'Upgrade-25H2.ps1';$bat=Join-Path $r 'Win11-25H2-Launcher.bat';$st=Join-Path $env:SystemRoot 'System32\schtasks.exe';New-Item -ItemType Directory -Path $r -Force|Out-Null;[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;iwr -UseBasicParsing 'https://raw.githubusercontent.com/sctcoder1/24to25/04e1e8e75c3c03586d832290ee52c1f48c714e10/Upgrade-25H2.ps1' -OutFile $ps;iwr -UseBasicParsing 'https://raw.githubusercontent.com/sctcoder1/24to25/04e1e8e75c3c03586d832290ee52c1f48c714e10/Win11-25H2-Launcher.bat' -OutFile $bat;if((Get-FileHash -Algorithm SHA256 $ps).Hash -ne 'FE151F18A4E29927CB42A33533F56DE34FAF222D19F70642B433A671DF51E416'){throw 'Upgrade-25H2.ps1 SHA256 mismatch'};if((Get-FileHash -Algorithm SHA256 $bat).Hash -ne '1ECFA11C3798D894DE76AA369025CD901162D9DFF0FC95BA1E3891E02212D42D'){throw 'Win11-25H2-Launcher.bat SHA256 mismatch'};& $st /Delete /TN 'Win11-25H2-AtStartup' /F 2>$null|Out-Null;& $st /Delete /TN 'Win11-25H2-Retry' /F 2>$null|Out-Null;& $st /Create /TN 'Win11-25H2-AtStartup' /TR 'cmd.exe /d /c C:\ProgramData\Win11-25H2\Win11-25H2-Launcher.bat' /SC ONSTART /RU SYSTEM /RL HIGHEST /F|Out-Null;if($LASTEXITCODE){throw 'Failed to create startup task'};& $st /Create /TN 'Win11-25H2-Retry' /TR 'cmd.exe /d /c C:\ProgramData\Win11-25H2\Win11-25H2-Launcher.bat' /SC HOURLY /MO 3 /RU SYSTEM /RL HIGHEST /F|Out-Null;if($LASTEXITCODE){throw 'Failed to create retry task'};& $st /Run /TN 'Win11-25H2-Retry'|Out-Null;if($LASTEXITCODE){throw 'Failed to start upgrade task'};Write-Output 'Scheduled SYSTEM upgrade tasks created and first run started.'"
 ```
 
 The one-liner downloads only the file at a pinned commit, verifies its SHA256 before execution, installs the scheduled tasks, and starts the first run. Do not use a `main` branch URL for production deployment.
@@ -32,6 +33,7 @@ On an endpoint, review:
 
 ```powershell
 Get-Content C:\ProgramData\Win11-25H2\Upgrade-25H2.log -Tail 100
+Get-Content C:\ProgramData\Win11-25H2\Launcher.log -Tail 50
 Get-Content C:\ProgramData\Win11-25H2\state.json
 Get-ScheduledTask Win11-25H2-AtStartup,Win11-25H2-Retry -ErrorAction SilentlyContinue
 ```
