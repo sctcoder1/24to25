@@ -17,15 +17,11 @@ Microsoft requires Windows 11 24H2 build **26100.5074** (KB5064081) or a later c
 
 ## Sophos Live Action deployment
 
-Copy the command from [`Sophos-Live-Action-One-Liner.txt`](Sophos-Live-Action-One-Liner.txt) and run it as a **CMD** command in Sophos Live Action. It downloads the pinned [`Upgrade-25H2.ps1`](Upgrade-25H2.ps1) and [`Win11-25H2-Launcher.bat`](Win11-25H2-Launcher.bat), verifies both files, creates the SYSTEM startup and three-hour retry tasks with `schtasks.exe`, starts the first task, and then returns control to Sophos immediately.
+Open [`Sophos-Live-Action-One-Liner.txt`](Sophos-Live-Action-One-Liner.txt), choose **Raw**, and copy that single plain-text line into a **CMD** command in Sophos Live Action. Copying from rendered chat or Markdown can turn bare URLs into `[text](url)` links and break the command.
 
-The same command is shown here for reference:
+The bootstrap performs a clean reinstall before starting: it ends and deletes both tasks from earlier attempts, terminates only orphaned processes whose command lines point to this workflow, cancels a restart only when this workflow's state says it scheduled one, and removes `C:\ProgramData\Win11-25H2`. It then downloads the pinned [`Upgrade-25H2.ps1`](Upgrade-25H2.ps1) and [`Win11-25H2-Launcher.bat`](Win11-25H2-Launcher.bat), verifies both files, recreates the SYSTEM tasks, starts the BAT-backed retry task, and returns control to Sophos immediately.
 
-```cmd
-powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop';$r='C:\ProgramData\Win11-25H2';$ps=Join-Path $r 'Upgrade-25H2.ps1';$bat=Join-Path $r 'Win11-25H2-Launcher.bat';$st=Join-Path $env:SystemRoot 'System32\schtasks.exe';New-Item -ItemType Directory -Path $r -Force|Out-Null;[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;iwr -UseBasicParsing 'https://raw.githubusercontent.com/sctcoder1/24to25/04e1e8e75c3c03586d832290ee52c1f48c714e10/Upgrade-25H2.ps1' -OutFile $ps;iwr -UseBasicParsing 'https://raw.githubusercontent.com/sctcoder1/24to25/04e1e8e75c3c03586d832290ee52c1f48c714e10/Win11-25H2-Launcher.bat' -OutFile $bat;if((Get-FileHash -Algorithm SHA256 $ps).Hash -ne 'FE151F18A4E29927CB42A33533F56DE34FAF222D19F70642B433A671DF51E416'){throw 'Upgrade-25H2.ps1 SHA256 mismatch'};if((Get-FileHash -Algorithm SHA256 $bat).Hash -ne '1ECFA11C3798D894DE76AA369025CD901162D9DFF0FC95BA1E3891E02212D42D'){throw 'Win11-25H2-Launcher.bat SHA256 mismatch'};& $st /End /TN 'Win11-25H2-AtStartup' 2>$null|Out-Null;& $st /End /TN 'Win11-25H2-Retry' 2>$null|Out-Null;& $st /Delete /TN 'Win11-25H2-AtStartup' /F 2>$null|Out-Null;& $st /Delete /TN 'Win11-25H2-Retry' /F 2>$null|Out-Null;& $st /Create /TN 'Win11-25H2-AtStartup' /TR 'cmd.exe /d /c C:\ProgramData\Win11-25H2\Win11-25H2-Launcher.bat' /SC ONSTART /RU SYSTEM /RL HIGHEST /F|Out-Null;if($LASTEXITCODE){throw 'Failed to create startup task'};& $st /Create /TN 'Win11-25H2-Retry' /TR 'cmd.exe /d /c C:\ProgramData\Win11-25H2\Win11-25H2-Launcher.bat' /SC HOURLY /MO 3 /RU SYSTEM /RL HIGHEST /F|Out-Null;if($LASTEXITCODE){throw 'Failed to create retry task'};& $st /Run /TN 'Win11-25H2-Retry'|Out-Null;if($LASTEXITCODE){throw 'Failed to start upgrade task'};Write-Output 'Scheduled SYSTEM upgrade tasks created and first run started.'"
-```
-
-The one-liner downloads only the file at a pinned commit, verifies its SHA256 before execution, installs the scheduled tasks, and starts the first run. Do not use a `main` branch URL for production deployment.
+The cleanup is deliberately scoped: it does not remove older projects such as `C:\Win11Upgrade`, unregister Microsoft Update, or purge the shared Windows Update cache.
 
 ## Verification and audit
 
