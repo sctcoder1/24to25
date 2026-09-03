@@ -14,7 +14,9 @@ Microsoft lists KB5054156 through Windows Update and WSUS, **not as a standalone
 
 ## Sophos: copy the new one-line CMD command
 
-**Publishing prerequisite:** these replacement files must first be uploaded to the root of `sctcoder1/24to25`. Repository publishing was blocked in the preparation session. Upload the actual files, not copied/pasted code, to preserve the reviewed bytes. The expected worker SHA256 is `3BDFAC11F713251A882595C278B9F43FA363FF05451BA9160A7052E0175E8ECE`. The command intentionally rejects the old GitHub worker.
+The 10-minute deployment ZIP contains only the four files to upload: `Upgrade-25H2.ps1`, `Win11-25H2-Launcher.bat`, `Sophos-Live-Action-One-Liner.txt`, and `README.md`. Optional test, repair and command-generator scripts are developer/support tools, not required deployment files. This version retains the state-save fix. It does not shorten an already scheduled countdown or change an endpoint until redeployed.
+
+**Publishing prerequisite:** these replacement files must first be uploaded to the root of `sctcoder1/24to25`. Repository publishing was blocked in the preparation session. Upload the actual files, not copied/pasted code, to preserve the reviewed bytes. The expected worker SHA256 is `E953A8856BCAE93B900CC8FF80FE458B6A77F89B06A91E427DD33BE07AC69D97`. The command intentionally rejects the old GitHub worker.
 
 Open [Sophos-Live-Action-One-Liner.txt](Sophos-Live-Action-One-Liner.txt), choose **Raw**, and copy the entire single line into **Sophos Live Action's CMD command**, running elevated/SYSTEM. Do not paste it at a PowerShell prompt. Do not copy Markdown `[url](url)` wrappers. Discard previously saved copies of the old command: their pinned commits still download the old worker.
 
@@ -48,9 +50,9 @@ Re-running the new bootstrap preserves direct-mode state, including reboot limit
 
 ## Restart behavior
 
-- No immediate restart: DISM uses `/Quiet /NoRestart`; successful servicing is followed by a **60-minute** Windows restart countdown, plus a best-effort message to signed-in users. Pending update servicing may also require a 60-minute restart before continuing.
+- No immediate restart: DISM uses `/Quiet /NoRestart`; successful servicing is followed by a **10-minute** Windows restart countdown, plus a best-effort message to signed-in users. Pending update servicing may also require a 10-minute restart before continuing.
 - **Save work. Windows forcibly closes applications when a timed restart expires**, even without an explicit `/f`. The countdown applies whether or not someone is logged in; this is not a user-consent prompt.
-- An existing system countdown is left unchanged (it may be sooner than 60 minutes). A retry does not extend or re-arm a countdown already recorded for the current boot. If an administrator cancels it with `shutdown /a`, restart manually to continue.
+- An existing system countdown is left unchanged (it may be sooner than 10 minutes). A retry does not extend or re-arm a countdown already recorded for the current boot. If an administrator cancels it with `shutdown /a`, restart manually to continue.
 - At most three automatic restart cycles and two successfully staged enablement attempts are allowed. Failed/partial servicing requiring attention stops automatic installs and restarts; tasks remain to report the condition. This prevents a persistent reboot loop.
 - After a later boot verifies client 25H2/build 26200 and no pending update restart, the worker removes its recognized startup/retry tasks. Script, BAT, logs, package and state remain for audit.
 
@@ -96,6 +98,8 @@ Do not blindly delete state to bypass ManualAttention or reboot limits. Investig
 A different Microsoft-signed KB5054156 file labeled Dev Channel Preview was rejected during verification. Do not substitute a similarly named download or weaken hash/signature checks. No MSU is redistributed by this repository; endpoints download directly from Microsoft.
 
 ## Development verification
+
+State-save hotfix: Windows PowerShell 5.1 converted the original `$null` backup argument to an empty path in File.Replace. The corrected worker uses `[NullString]::Value`. `Test-StatePersistence.ps1` reproduces actual first-write/replacement behavior on disk and verifies the exact repair/backup hashes, without touching servicing or tasks. On an already affected endpoint, run `Repair-25H2-State.ps1` elevated: it patches only the known affected worker, holds both worker mutexes, preserves the previous script, and leaves state/logs/package unchanged. It does not start a task or reboot. After it succeeds, start `Win11-25H2-Retry` to resume normal processing and the delayed restart. For new deployments, upload the corrected worker AND corrected one-liner (its approved hash changed).
 
 `Test-DirectUpgrade.ps1` parses the worker and loads only function definitions. All worker/task/native servicing behavior is mocked; it does not run the entrypoint, install updates, register tasks or restart anything. Run with Windows PowerShell 5.1. If the separately downloaded verification MSU is available locally, the suite additionally verifies its real hash/signature. Tests cover target restrictions, exact task ownership/migration, direct/CU selection, partial failures, interrupt recovery, post-boot completion and countdown bounds. This is not an end-to-end upgrade certification.
 
