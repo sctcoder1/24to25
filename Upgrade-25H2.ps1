@@ -1,197 +1,279 @@
-#requires -version 5.1
+#requires -Version 5.1
+# Direct x64 24H2 -> 25H2 deployment. See README before using -AllowOfferBypass.
 [CmdletBinding()]
-param(
-    [switch]$Install
-)
-
+param([switch]$Install,[switch]$AllowOfferBypass,[switch]$CheckOnly)
 Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
+$ErrorActionPreference='Stop'
+if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
+    $native=Join-Path $env:SystemRoot 'Sysnative\WindowsPowerShell\v1.0\powershell.exe'
+    $arguments=@('-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',$PSCommandPath)
+    if($Install){$arguments+='-Install'}; if($AllowOfferBypass){$arguments+='-AllowOfferBypass'}; if($CheckOnly){$arguments+='-CheckOnly'}
+    & $native @arguments; exit $LASTEXITCODE
+}
+$Root='C:\ProgramData\Win11-25H2'
+$Worker=Join-Path $Root 'Upgrade-25H2.ps1'
+$LogPath=Join-Path $Root 'Upgrade-25H2.log'
+$StatePath=Join-Path $Root 'direct-state.json'
+$TaskNames=@('Win11-25H2-AtStartup','Win11-25H2-Retry','Win11-25H2-Startup')
+$MutexNames=@('Global\Win11-25H2-Upgrade','Global\Win11_24H2_to_25H2_Upgrade')
+$PackageUri='https://catalog.sf.dl.delivery.mp.microsoft.com/filestreamingservice/files/67731ce0-1988-426a-afa3-044a032eb6c6/public/windows11.0-kb5054156-x64_9fd13360d2c5af23ec4f591b86f1c1db37aada37.msu'
+$PackageHash='59A2B315141DA42066183C11F6233D974DE050B41CBB760AAFB8C89B0C88C616'
+$PackageIdentity='Package_for_KB5054156~31bf3856ad364e35~amd64~~26100.6717.1.4'
+$State=@{Schema=1;Phase='Starting';Detail='';UpdatedUtc='';PendingBoot='';RestartBoot='';Reason='';InstallBoot='';Stages=0;Reboots=0;ManualAttention=$false}
 
-$Root = Join-Path $env:ProgramData 'Win11-25H2'
-$ScriptPath = Join-Path $Root 'Upgrade-25H2.ps1'
-$LogPath = Join-Path $Root 'Upgrade-25H2.log'
-$StatePath = Join-Path $Root 'state.json'
-$StartupTask = 'Win11-25H2-AtStartup'
-$RetryTask = 'Win11-25H2-Retry'
-$MicrosoftUpdateServiceId = '7971f918-a847-4430-9279-4a52d1efe18d'
-$MinimumPrerequisiteBuild = 5074 # KB5064081 (26100.5074) or any later CU
-
-New-Item -Path $Root -ItemType Directory -Force | Out-Null
-
-function Write-Log {
-    param([Parameter(Mandatory)][string]$Message, [ValidateSet('INFO','WARN','ERROR')][string]$Level = 'INFO')
-    $line = '{0:u} [{1}] {2}' -f (Get-Date), $Level, $Message
+function Get-Snapshot {
+    $cv=Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+    $os=Get-CimInstance Win32_OperatingSystem
+    [pscustomobject]@{Type=[string]$cv.InstallationType;Release=[string]$cv.DisplayVersion;Build=[int]$cv.CurrentBuildNumber;UBR=[int]$cv.UBR;Running=[int]$os.BuildNumber;Boot=$os.LastBootUpTime.ToUniversalTime().ToString('o');Arch=$env:PROCESSOR_ARCHITECTURE;Edition=[string]$cv.EditionID}
+}
+function Get-Disposition($os) {
+    if($os.Type -ne 'Client' -or $os.Arch -ne 'AMD64' -or $os.Edition -match '^(EnterpriseS|IoTEnterpriseS)'){return 'Unsupported'}
+    if($os.Release -eq '25H2' -and $os.Build -eq 26200 -and $os.Running -eq 26200){return 'Complete'}
+    if($os.Release -eq '25H2' -and $os.Build -eq 26200 -and $os.Running -eq 26100){return 'Staged'}
+    if($os.Release -eq '24H2' -and $os.Build -eq 26100 -and $os.Running -eq 26100){return 'Eligible'}
+    return 'Unsupported'
+}
+function Assert-Path($path) {
+    if(Test-Path -LiteralPath $path){if((Get-Item -LiteralPath $path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint){throw "Refusing redirected path: $path"}}
+}
+function Protect-Path($path) {
+    Assert-Path $path
+    $acl=Get-Acl -LiteralPath $path
+    $acl.SetSecurityDescriptorSddlForm('O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)')
+    Set-Acl -LiteralPath $path -AclObject $acl
+}
+function Write-Log([string]$message) {
+    $line=('{0} [Direct25H2] {1}' -f [datetime]::UtcNow.ToString('o'),$message)
     Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
-    Write-Output $line
+    Write-Host $line
 }
-
-function Get-OsInfo {
-    $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
-    [pscustomobject]@{
-        ProductName    = [string]$cv.ProductName
-        InstallationType = [string]$cv.InstallationType
-        DisplayVersion = [string]$cv.DisplayVersion
-        CurrentBuild   = [int]$cv.CurrentBuild
-        UBR            = [int]$cv.UBR
-    }
+function Save-State([string]$phase,[string]$detail) {
+    $script:State.Phase=$phase; $script:State.Detail=$detail; $script:State.UpdatedUtc=[datetime]::UtcNow.ToString('o')
+    $temp=Join-Path $Root ('state-'+[guid]::NewGuid().ToString('N')+'.tmp')
+    [IO.File]::WriteAllText($temp,($script:State | ConvertTo-Json),(New-Object Text.UTF8Encoding($false)))
+    if(Test-Path -LiteralPath $StatePath){[IO.File]::Replace($temp,$StatePath,$null)}else{[IO.File]::Move($temp,$StatePath)}
 }
-
-function Test-IsSystem {
-    return [Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq 'S-1-5-18'
+function Get-OwnedTasks {
+    @(Get-ScheduledTask -ErrorAction Stop | Where-Object {$_.TaskPath -eq '\' -and $_.TaskName -in $TaskNames})
 }
-
-function Install-ScheduledTasks {
-    if (-not (Test-IsSystem)) { throw 'Installation must run as LocalSystem (SYSTEM).' }
-
-    if ($PSCommandPath -ne $ScriptPath) {
-        Copy-Item -LiteralPath $PSCommandPath -Destination $ScriptPath -Force
-    }
-
-    $action = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -Argument "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$ScriptPath`""
-    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-    $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 2) -RestartCount 2 -RestartInterval (New-TimeSpan -Minutes 15)
-
-    Register-ScheduledTask -TaskName $StartupTask -Action $action -Trigger (New-ScheduledTaskTrigger -AtStartup) -Principal $principal -Settings $settings -Description 'Continue and verify the Windows 11 25H2 upgrade after startup.' -Force | Out-Null
-    $retryTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Hours 3) -RepetitionDuration (New-TimeSpan -Days 3650)
-    Register-ScheduledTask -TaskName $RetryTask -Action $action -Trigger $retryTrigger -Principal $principal -Settings $settings -Description 'Retry the Windows 11 25H2 upgrade every three hours until verified.' -Force | Out-Null
-    Write-Log 'Scheduled SYSTEM startup and three-hour retry tasks.'
-    Start-ScheduledTask -TaskName $RetryTask
-}
-
-function Remove-UpgradeTasks {
-    foreach ($name in @($StartupTask, $RetryTask)) {
-        if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) {
-            Unregister-ScheduledTask -TaskName $name -Confirm:$false
-            Write-Log "Removed completed task: $name"
+function Assert-OwnedTaskActions($tasks) {
+    foreach($task in $tasks){
+        if(@($task.Actions).Count -eq 0){throw "Task name collision with no recognizable action: $($task.TaskName). Nothing will be deleted."}
+        foreach($action in $task.Actions){
+            if(($action.Execute+' '+$action.Arguments) -notmatch '(?i)C:\\ProgramData\\Win11-25H2\\(Upgrade-25H2\.ps1|Upgrade-24H2-to-25H2\.ps1|Win11-25H2-Launcher\.bat)(?=["\s]|$)'){
+                throw "Task name collision with an unrecognized action: $($task.TaskName). Nothing will be deleted."
+            }
         }
     }
 }
-
-function Save-State {
-    param([Parameter(Mandatory)][string]$Phase, [string]$Detail = '')
-    [pscustomobject]@{ Phase=$Phase; Detail=$Detail; Updated=(Get-Date).ToUniversalTime().ToString('o') } |
-        ConvertTo-Json | Set-Content -LiteralPath $StatePath -Encoding UTF8
+function Test-RebootPending {
+    $info=New-Object -ComObject Microsoft.Update.SystemInfo
+    return ($info.RebootRequired -or (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'))
 }
-
-function Request-DelayedRestart {
-    param([Parameter(Mandatory)][string]$Reason)
-    Save-State -Phase 'RestartPending' -Detail $Reason
-    $message = "Windows 11 maintenance has installed required updates. This computer will restart in 60 minutes to continue the Windows 11 25H2 upgrade. Save your work now. Reason: $Reason"
-    & "$env:SystemRoot\System32\msg.exe" * /TIME:3600 $message 2>&1 | ForEach-Object { Write-Log ([string]$_) }
-    $p = Start-Process -FilePath "$env:SystemRoot\System32\shutdown.exe" -ArgumentList @('/r','/t','3600','/d','p:2:17','/c',"`"$message`"") -Wait -PassThru -WindowStyle Hidden
-    if ($p.ExitCode -eq 0) {
-        Write-Log "Scheduled restart in 60 minutes: $Reason"
-    } else {
-        Write-Log "Restart request returned exit code $($p.ExitCode), usually because a restart is already scheduled." 'WARN'
+function Invoke-Notice($message) {
+    try{$ErrorActionPreference='Continue'; & "$env:SystemRoot\System32\msg.exe" '*' /TIME:3600 $message 2>&1 | Out-Null; Write-Log "User message attempted; exit=$LASTEXITCODE"}catch{Write-Log 'User message unavailable; native restart notification still applies.'}
+}
+function Invoke-Countdown($message) {
+    $ErrorActionPreference='Continue'
+    $output=& "$env:SystemRoot\System32\shutdown.exe" /r /t 3600 /d p:2:3 /c $message 2>&1
+    [pscustomobject]@{Code=$LASTEXITCODE;Text=($output | Out-String)}
+}
+function Request-Reboot($reason,$boot) {
+    $script:State.PendingBoot=$boot; $script:State.Reason=$reason
+    if($script:State.RestartBoot -eq $boot){Save-State 'AwaitingRestart' $reason; Write-Log 'Restart already requested this boot; not extending or re-arming it. If cancelled, restart manually.'; return}
+    if($script:State.Reboots -ge 3){throw 'Three automatic restart cycles reached. Review servicing logs; further restarts require administrator action.'}
+    Save-State 'RebootNeeded' $reason
+    $message="Windows 11 maintenance: this computer will restart in 60 minutes. Save your work; applications will close. $reason"
+    $result=Invoke-Countdown $message
+    if($result.Code -notin 0,1190){throw "Restart scheduling failed ($($result.Code)): $($result.Text)"}
+    $script:State.RestartBoot=$boot; $script:State.Reboots=[int]$script:State.Reboots+1; Save-State 'AwaitingRestart' $reason
+    if($result.Code -eq 0){Invoke-Notice $message; Write-Log 'Restart scheduled in 60 minutes.'}else{Write-Log 'Another restart is already scheduled; its deadline was not changed.'}
+}
+function Get-LauncherText {
+    @'
+@echo off
+setlocal
+set "ROOT=C:\ProgramData\Win11-25H2"
+set "PS=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
+if exist "%SystemRoot%\Sysnative\WindowsPowerShell\v1.0\powershell.exe" set "PS=%SystemRoot%\Sysnative\WindowsPowerShell\v1.0\powershell.exe"
+echo [%date% %time%] Direct25H2 launcher started.>>"%ROOT%\Launcher.log"
+"%PS%" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%ROOT%\Upgrade-25H2.ps1" -AllowOfferBypass >>"%ROOT%\Launcher.log" 2>&1
+set "RC=%ERRORLEVEL%"
+echo [%date% %time%] Direct25H2 launcher finished with exit code %RC%.>>"%ROOT%\Launcher.log"
+exit /b %RC%
+'@
+}
+function Install-Tasks([string]$sourceFile) {
+    $tasks=@(Get-OwnedTasks); Assert-OwnedTaskActions $tasks
+    if(@($tasks | Where-Object {$_.State -eq 'Running'}).Count){throw 'An old task is running. Wait for it to finish; do not kill servicing.'}
+    $history=Join-Path $Root ('history-'+[guid]::NewGuid().ToString('N')); $null=New-Item -ItemType Directory -Path $history
+    foreach($name in @('Upgrade-25H2.ps1','Win11-25H2-Launcher.bat')){
+        $path=Join-Path $Root $name; Assert-Path $path
+        if(Test-Path -LiteralPath $path){Copy-Item -LiteralPath $path -Destination (Join-Path $history $name)}
+    }
+    if([IO.Path]::GetFullPath($sourceFile) -ne $Worker){Copy-Item -LiteralPath $sourceFile -Destination $Worker -Force}
+    $bat=Join-Path $Root 'Win11-25H2-Launcher.bat'
+    Write-LauncherFile $bat
+    Protect-Path $Worker; Protect-Path $bat
+    $action=New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\cmd.exe" -Argument '/d /c C:\ProgramData\Win11-25H2\Win11-25H2-Launcher.bat'
+    $principal=New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    $settings=New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([timespan]::Zero)
+    $retry=New-ScheduledTaskTrigger -Once -At ((Get-Date).AddHours(3)) -RepetitionInterval (New-TimeSpan -Hours 3)
+    $null=Register-ScheduledTask -TaskPath '\' -TaskName $TaskNames[0] -Action $action -Principal $principal -Settings $settings -Trigger (New-ScheduledTaskTrigger -AtStartup) -Force
+    $null=Register-ScheduledTask -TaskPath '\' -TaskName $TaskNames[1] -Action $action -Principal $principal -Settings $settings -Trigger $retry -Force
+    foreach($old in @($tasks | Where-Object {$_.TaskName -eq 'Win11-25H2-Startup'})){
+        Unregister-ScheduledTask -InputObject $old -Confirm:$false
+        Write-Log 'Removed superseded Win11-25H2-Startup task; its script and logs were retained.'
+    }
+    Write-Log 'Direct mode installed: SYSTEM BAT tasks at startup and every 3 hours. Offer and safeguard gating bypass authorized; signatures and applicability remain enforced.'
+}
+function Write-LauncherFile($path) {
+    [IO.File]::WriteAllText($path,((Get-LauncherText) -replace '\r?\n',"`r`n"),[Text.Encoding]::ASCII)
+}
+function Test-Candidate($update) {
+    return (-not $update.BrowseOnly -and -not $update.InstallationBehavior.CanRequestUserInput -and $update.Title -match '(?i)Cumulative Update.*Windows 11.*24H2' -and $update.Title -notmatch '(?i)Preview|Insider|Dynamic|Safe OS|\.NET')
+}
+function Invoke-Wua($owner,[string]$kind,[string]$criteria='') {
+    if(-not ('Direct25H2.Callback' -as [type])){Add-Type 'using System.Runtime.InteropServices; namespace Direct25H2 { [ComVisible(true),ClassInterface(ClassInterfaceType.AutoDispatch)] public class Callback { [DispId(0)] public void Invoke(object job,object args){} } }'}
+    $callback=New-Object Direct25H2.Callback
+    Save-State $kind 'Prerequisite update operation'; Write-Log "Prerequisite $kind started."
+    switch($kind){Search{$job=$owner.BeginSearch($criteria,$callback,$null)} Download{$job=$owner.BeginDownload($callback,$callback,$null)} Install{$job=$owner.BeginInstall($callback,$callback,$null)}}
+    $watch=[Diagnostics.Stopwatch]::StartNew(); $last=-60; $aborted=$false
+    while(-not $job.IsCompleted){
+        if($watch.Elapsed.TotalSeconds-$last -ge 60){$progress=''; if($kind -ne 'Search'){$progress=" $($job.GetProgress().PercentComplete)%"}; Write-Log "$kind still active.$progress"; $last=$watch.Elapsed.TotalSeconds}
+        if(-not $aborted -and $watch.Elapsed.TotalMinutes -ge 180){$job.RequestAbort(); $aborted=$true; Write-Log 'Requested soft cancellation after 3 hours; waiting, never killing servicing.'}
+        Start-Sleep -Seconds 5
+    }
+    switch($kind){Search{$result=$owner.EndSearch($job)} Download{$result=$owner.EndDownload($job)} Install{$result=$owner.EndInstall($job)}}
+    $watch.Stop(); return $result
+}
+function Install-Prerequisite($boot) {
+    $session=New-Object -ComObject Microsoft.Update.Session; $session.ClientApplicationID='Direct25H2'; $session.UserLocale=1033
+    $searcher=$session.CreateUpdateSearcher(); $searcher.ServerSelection=2; $searcher.Online=$true
+    $result=Invoke-Wua $searcher Search "IsInstalled=0 and IsHidden=0 and Type='Software'"
+    if($result.ResultCode -ne 2){throw "Incomplete prerequisite scan: $($result.ResultCode)"}
+    $updates=@(for($i=0;$i -lt $result.Updates.Count;$i++){$u=$result.Updates.Item($i); if(Test-Candidate $u){$u}})
+    if(-not $updates.Count){throw 'No applicable non-preview 24H2 cumulative update offered. Minimum 26100.5074 is not bypassed.'}
+    $chosen=$updates | Sort-Object LastDeploymentChangeTime -Descending | Select-Object -First 1
+    Write-Log "Prerequisite selected: $($chosen.Title)"
+    if(-not $chosen.EulaAccepted){$chosen.AcceptEula()}
+    $collection=New-Object -ComObject Microsoft.Update.UpdateColl; $null=$collection.Add($chosen)
+    $downloader=$session.CreateUpdateDownloader(); $downloader.Updates=$collection
+    $download=Invoke-Wua $downloader Download; $item=$download.GetUpdateResult(0)
+    if($download.ResultCode -ne 2 -or $item.ResultCode -ne 2 -or -not $chosen.IsDownloaded){throw "Prerequisite download failed. HRESULT=$($item.HResult)"}
+    $installer=$session.CreateUpdateInstaller(); $installer.Updates=$collection; $installer.ForceQuiet=$true; $installer.AllowSourcePrompts=$false
+    if($installer.IsBusy -or $installer.RebootRequiredBeforeInstallation){throw 'Servicing is busy or now requires a restart. Retry later.'}
+    $installed=Invoke-Wua $installer Install; $item=$installed.GetUpdateResult(0)
+    if($installed.ResultCode -ne 2 -or $item.ResultCode -ne 2){
+        if($installed.RebootRequired -or $item.RebootRequired){$script:State.ManualAttention=$true}
+        throw "Prerequisite installation incomplete. HRESULT=$($item.HResult); no restart requested for a partial result."
+    }
+    if($installed.RebootRequired -or $item.RebootRequired -or (Test-RebootPending)){Request-Reboot '24H2 prerequisite installed; upgrade resumes after restart.' $boot}
+    else{Save-State 'PrerequisiteInstalled' 'Recheck build on next retry.'}
+}
+function Assert-Package($path) {
+    Assert-Path $path
+    if((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $PackageHash){throw 'KB5054156 SHA256 mismatch; refusing installation.'}
+    $signature=Get-AuthenticodeSignature -LiteralPath $path
+    if($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch '(^|,\s*)O=Microsoft Corporation(,|$)'){throw 'KB5054156 signature is not valid and Microsoft-signed; refusing installation.'}
+}
+function Get-EnablementPackage {
+    $cache=Join-Path $Root 'Payload'; Assert-Path $cache; $null=New-Item -ItemType Directory -Path $cache -Force; Protect-Path $cache
+    $path=Join-Path $cache 'Windows11.0-KB5054156-x64.msu'; Assert-Path $path
+    if(Test-Path -LiteralPath $path){
+        try{Assert-Package $path; Write-Log 'Using verified cached KB5054156.'; return $path}
+        catch{Move-Item -LiteralPath $path -Destination ($path+'.rejected-'+[guid]::NewGuid().ToString('N')); Write-Log 'Cached payload rejected and retained for audit; downloading again.'}
+    }
+    $temp=Join-Path $cache ([guid]::NewGuid().ToString('N')+'.partial.msu')
+    [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
+    Write-Log 'Downloading released KB5054156 directly from Microsoft (175575 bytes); no feature-update offer required.'
+    Invoke-WebRequest -UseBasicParsing -Uri $PackageUri -OutFile $temp -TimeoutSec 120
+    Assert-Package $temp
+    Move-Item -LiteralPath $temp -Destination $path
+    Protect-Path $path; Write-Log 'KB5054156 hash and Microsoft signature verified.'; return $path
+}
+function Invoke-Dism($path) {
+    $dismLog=Join-Path $Root ('DISM-'+[guid]::NewGuid().ToString('N')+'.log')
+    $arguments='/Online /Add-Package /PackagePath:"{0}" /Quiet /NoRestart /English /LogPath:"{1}"' -f $path,$dismLog
+    Write-Log "DISM installing enablement package; log=$dismLog"
+    $process=Start-Process -FilePath "$env:SystemRoot\System32\dism.exe" -ArgumentList $arguments -PassThru -WindowStyle Hidden
+    while(-not $process.WaitForExit(60000)){Write-Log "DISM PID=$($process.Id) still running; do not interrupt servicing."}
+    $process.WaitForExit(); $code=$process.ExitCode; $process.Dispose()
+    Write-Log "DISM exit=$code"; return $code
+}
+function Get-EnablementState {
+    @(Get-WindowsPackage -Online -ErrorAction Stop | Where-Object {$_.PackageName -eq $PackageIdentity -and [string]$_.PackageState -in 'Installed','InstallPending'})
+}
+function Invoke-Worker($snapshot,$disposition) {
+    if($disposition -eq 'Complete' -and $State.InstallBoot -ne $snapshot.Boot -and -not (Test-RebootPending)){
+        Save-State 'Complete' 'Windows 11 25H2 verified after reboot.'; Remove-CompletedTasks; Write-Log 'COMPLETE: 25H2 verified; scripts, state, package and logs retained.'
+    }
+    else {
+        if($State.ManualAttention){throw 'Previous partial installation needs administrator review. See logs; no automatic install/restart attempted.'}
+        if($State.PendingBoot -eq $snapshot.Boot){Request-Reboot $State.Reason $snapshot.Boot}
+        else {
+            $State.PendingBoot=''; $State.RestartBoot=''
+            $busy=New-Object -ComObject Microsoft.Update.Installer
+            if($busy.IsBusy){throw 'Windows Update installation is active; waiting for next retry.'}
+            if(@(Get-Process -Name dism,wusa,SetupHost -ErrorAction SilentlyContinue).Count){throw 'Another native servicing process is active; wait for it to finish. No process will be killed.'}
+            if($State.InstallBoot -eq $snapshot.Boot -and $disposition -eq 'Eligible' -and -not (Test-RebootPending)){
+                if(-not @(Get-EnablementState).Count){$State.InstallBoot=''; Write-Log 'Interrupted attempt has no installed/pending enablement package; retrying without inferring a successful install.'}
+            }
+            if(Test-RebootPending){Request-Reboot 'Windows has pending update servicing; direct upgrade continues after restart.' $snapshot.Boot}
+            elseif($disposition -in 'Staged','Complete' -or $State.InstallBoot -eq $snapshot.Boot){Request-Reboot '25H2 servicing needs post-reboot verification.' $snapshot.Boot}
+            elseif($snapshot.UBR -lt 5074){Install-Prerequisite $snapshot.Boot}
+            else {
+                if($State.Stages -ge 2){throw 'Two successful staging cycles did not reach 25H2. Investigate rollback; automatic reboot loop stopped.'}
+                if((Get-PSDrive C).Free -lt 5GB){throw 'At least 5 GB free on C: is required by this deployment.'}
+                $path=Get-EnablementPackage
+                $State.InstallBoot=$snapshot.Boot; Save-State 'InstallingEnablement' 'Offer/safeguard gating bypass; native package applicability retained.'
+                $code=Invoke-Dism $path
+                if($code -notin 0,3010){$State.InstallBoot=''; if(Test-RebootPending){$State.ManualAttention=$true}; throw "DISM failed ($code); see DISM log. No success/restart inferred. Native applicability checks were not bypassed."}
+                $package=@(Get-EnablementState)
+                if(-not $package.Count){$State.ManualAttention=$true; throw 'DISM returned success but the expected package is not Installed/InstallPending. Review required; no success/restart inferred.'}
+                $State.Stages=[int]$State.Stages+1
+                Request-Reboot 'Windows 11 25H2 enablement installed; restart completes the upgrade.' $snapshot.Boot
+            }
+        }
     }
 }
-
-function New-MicrosoftUpdateSearcher {
-    $manager = New-Object -ComObject Microsoft.Update.ServiceManager
-    $manager.ClientApplicationID = 'Win11-25H2-Sophos'
-    try { $null = $manager.AddService2($MicrosoftUpdateServiceId, 7, '') } catch { Write-Log "Microsoft Update registration note: $($_.Exception.Message)" 'WARN' }
-    $session = New-Object -ComObject Microsoft.Update.Session
-    $session.ClientApplicationID = 'Win11-25H2-Sophos'
-    $searcher = $session.CreateUpdateSearcher()
-    $searcher.ServerSelection = 3 # ssOthers; explicitly bypasses the managed WSUS source
-    $searcher.ServiceID = $MicrosoftUpdateServiceId
-    return [pscustomobject]@{ Session=$session; Searcher=$searcher }
+function Remove-CompletedTasks {
+    $tasks=@(Get-OwnedTasks); Assert-OwnedTaskActions $tasks
+    foreach($task in $tasks){Unregister-ScheduledTask -InputObject $task -Confirm:$false; Write-Log "Removed completed task $($task.TaskName)."}
 }
 
-function Find-Updates {
-    param([Parameter(Mandatory)]$Searcher, [Parameter(Mandatory)][scriptblock]$Predicate)
-    Write-Log 'Scanning the public Microsoft Update service.'
-    $result = $Searcher.Search("IsInstalled=0 and IsHidden=0 and Type='Software'")
-    $matches = @()
-    for ($i=0; $i -lt $result.Updates.Count; $i++) {
-        $update = $result.Updates.Item($i)
-        if (& $Predicate $update) { $matches += $update }
-    }
-    return $matches
-}
-
-function Install-Updates {
-    param([Parameter(Mandatory)]$Session, [Parameter(Mandatory)][object[]]$Updates)
-    if ($Updates.Count -eq 0) { throw 'No applicable update was supplied to Install-Updates.' }
-    $collection = New-Object -ComObject Microsoft.Update.UpdateColl
-    foreach ($update in $Updates) {
-        if (-not $update.EulaAccepted) { $update.AcceptEula() }
-        $null = $collection.Add($update)
-        Write-Log "Selected update: $($update.Title)"
-    }
-    $downloader = $Session.CreateUpdateDownloader()
-    $downloader.Updates = $collection
-    $download = $downloader.Download()
-    if ($download.ResultCode -notin 2,3) { throw "Update download failed with WUA result code $($download.ResultCode), HRESULT 0x{0:X8}." -f ($download.HResult -band 0xffffffff) }
-    $installer = $Session.CreateUpdateInstaller()
-    $installer.Updates = $collection
-    $installResult = $installer.Install()
-    Write-Log "Install completed with WUA result code $($installResult.ResultCode), HRESULT 0x$('{0:X8}' -f ($installResult.HResult -band 0xffffffff)), reboot required: $($installResult.RebootRequired)."
-    if ($installResult.ResultCode -notin 2,3) { throw "Update installation failed with WUA result code $($installResult.ResultCode)." }
-    return $installResult
-}
-
-if ($Install) {
-    Install-ScheduledTasks
-    exit 0
-}
-
-$createdMutex = $false
-$mutex = New-Object Threading.Mutex($false, 'Global\Win11-25H2-Upgrade', [ref]$createdMutex)
-if (-not $mutex.WaitOne(0)) {
-    Write-Log 'Another upgrade instance is already running; this invocation will exit.' 'WARN'
-    exit 0
-}
-
+$snapshot=Get-Snapshot; $disposition=Get-Disposition $snapshot
+if($CheckOnly){$snapshot | Format-List | Out-Host; Write-Host "Disposition=$disposition; minimum=26100.5074; mode=direct enablement"; Get-OwnedTasks | Select-Object TaskName,State | Format-Table | Out-Host; exit 0}
+if($disposition -eq 'Unsupported'){throw 'Only x64 Windows 11 24H2 clients (not LTSC) or completed 25H2 targets are supported. No bypass of release/architecture restrictions.'}
+if(-not $AllowOfferBypass){throw 'Direct installation bypasses Windows Update offer/safeguard gating. Explicit -AllowOfferBypass is required. See README.'}
+$identity=[Security.Principal.WindowsIdentity]::GetCurrent()
+$principal=New-Object Security.Principal.WindowsPrincipal($identity)
+if(-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'Run installation elevated or via Sophos SYSTEM.'}
+if(-not $Install -and $identity.User.Value -ne 'S-1-5-18'){throw 'Use -Install to register SYSTEM tasks; do not launch the worker interactively.'}
+$locks=@(); $startFirst=$false; $exitCode=0; $initialized=$false
 try {
-    if (-not (Test-IsSystem)) { throw 'Upgrade execution must run as LocalSystem (SYSTEM).' }
-    $os = Get-OsInfo
-    Write-Log "Detected registry product '$($os.ProductName)', installation type $($os.InstallationType), version $($os.DisplayVersion), build $($os.CurrentBuild).$($os.UBR)."
-
-    # Windows 11 can retain the legacy registry ProductName "Windows 10 Pro".
-    # InstallationType plus the release/build is authoritative for this workflow.
-    if ($os.InstallationType -ne 'Client') { throw "Out of scope: installation type '$($os.InstallationType)' is not a Windows client." }
-    if ($os.DisplayVersion -eq '25H2' -and $os.CurrentBuild -ge 26200) {
-        Save-State -Phase 'Complete' -Detail "Verified Windows 11 25H2 build $($os.CurrentBuild).$($os.UBR)"
-        Write-Log 'Windows 11 25H2 is verified. Upgrade workflow is complete.'
-        Remove-UpgradeTasks
-        exit 0
+    foreach($name in $MutexNames){
+        $mutex=New-Object Threading.Mutex($false,$name); $owned=$false
+        try{$owned=$mutex.WaitOne(0)}catch [Threading.AbandonedMutexException]{$owned=$true}
+        if(-not $owned){$mutex.Dispose(); throw 'Another old/new upgrade worker is active. No worker was stopped; wait and retry.'}
+        $locks+=,$mutex
     }
-    if ($os.DisplayVersion -ne '24H2' -or $os.CurrentBuild -ne 26100) {
-        throw "Out of scope: only Windows 11 24H2 (build 26100) is targeted; detected $($os.DisplayVersion) build $($os.CurrentBuild)."
+    Assert-Path $Root; $null=New-Item -ItemType Directory -Path $Root -Force; Protect-Path $Root
+    foreach($name in @('Upgrade-25H2.log','Launcher.log','direct-state.json')){$path=Join-Path $Root $name; Assert-Path $path; if(Test-Path -LiteralPath $path){Protect-Path $path}}
+    if(Test-Path -LiteralPath $StatePath){
+        $loaded=Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
+        if($loaded.Schema -ne 1){throw 'Unrecognized direct-state schema; review state before continuing.'}
+        foreach($property in $loaded.PSObject.Properties){$State[$property.Name]=$property.Value}
     }
-
-    $wu = New-MicrosoftUpdateSearcher
-    if ($os.UBR -lt $MinimumPrerequisiteBuild) {
-        Save-State -Phase 'InstallingPrerequisite' -Detail "Build is below 26100.$MinimumPrerequisiteBuild"
-        $cus = @(Find-Updates -Searcher $wu.Searcher -Predicate {
-            param($u)
-            $u.Title -match '(?i)Cumulative Update for Windows 11 Version 24H2' -and
-            $u.Title -notmatch '(?i)Preview|Dynamic Update|\.NET Framework'
-        })
-        if ($cus.Count -eq 0) { throw 'No applicable non-preview Windows 11 24H2 cumulative update was offered by Microsoft Update.' }
-        $chosen = @($cus | Sort-Object LastDeploymentChangeTime -Descending | Select-Object -First 1)
-        $result = Install-Updates -Session $wu.Session -Updates $chosen
-        Request-DelayedRestart -Reason '24H2 cumulative update prerequisite installed'
-        exit 0
-    }
-
-    Save-State -Phase 'Installing25H2' -Detail 'Prerequisite build verified'
-    $featureUpdates = @(Find-Updates -Searcher $wu.Searcher -Predicate {
-        param($u)
-        $u.Title -match '(?i)^Windows 11,? version 25H2$|Feature update to Windows 11,? version 25H2'
-    })
-    if ($featureUpdates.Count -eq 0) { throw 'Microsoft Update did not offer Windows 11 version 25H2. The device may be under a safeguard hold or not yet eligible; the task will retry.' }
-    $feature = @($featureUpdates | Sort-Object LastDeploymentChangeTime -Descending | Select-Object -First 1)
-    $result = Install-Updates -Session $wu.Session -Updates $feature
-    Request-DelayedRestart -Reason 'Windows 11 version 25H2 installed'
+    $initialized=$true
+    Write-Log "Mode=direct; $($snapshot.Release) $($snapshot.Build).$($snapshot.UBR); running=$($snapshot.Running); bypass authorized."
+    if($Install){Install-Tasks $PSCommandPath; $startFirst=$true}
+    else { Invoke-Worker $snapshot $disposition }
+}catch{
+    $exitCode=1; $detail=$_.Exception.Message
+    if($initialized){try{Write-Log "ERROR: $detail"; Save-State 'FailedWillRetry' $detail}catch{Write-Error $detail -ErrorAction Continue}}else{Write-Error $detail -ErrorAction Continue}
+}finally{
+    foreach($mutex in $locks){try{$mutex.ReleaseMutex()}finally{$mutex.Dispose()}}
 }
-catch {
-    $detail = $_ | Out-String
-    Save-State -Phase 'FailedWillRetry' -Detail $_.Exception.Message
-    Write-Log $detail.Trim() 'ERROR'
-    exit 1
-}
-finally {
-    if ($mutex) { try { $mutex.ReleaseMutex() } catch {}; $mutex.Dispose() }
-}
+if($startFirst -and $exitCode -eq 0){Start-ScheduledTask -TaskPath '\' -TaskName 'Win11-25H2-Retry' -ErrorAction Stop; Write-Host 'Direct25H2 SYSTEM tasks registered; first run requested. Read Upgrade-25H2.log and direct-state.json.'}
+exit $exitCode
