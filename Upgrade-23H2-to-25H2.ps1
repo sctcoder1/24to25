@@ -99,7 +99,7 @@ function Write-Log([string]$Message) {
     Ensure-Root
     $line = '{0} [23H2Special] {1}' -f [datetime]::UtcNow.ToString('o'), $Message
     Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
-    Write-Output $line
+    Write-Host $line
 }
 
 function Save-State([string]$Phase,[string]$Detail) {
