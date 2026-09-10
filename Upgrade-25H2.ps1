@@ -71,11 +71,11 @@ function Test-RebootPending {
     return ($info.RebootRequired -or (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'))
 }
 function Invoke-Notice($message) {
-    try{$ErrorActionPreference='Continue'; & "$env:SystemRoot\System32\msg.exe" '*' /TIME:600 $message 2>&1 | Out-Null; Write-Log "User message attempted; exit=$LASTEXITCODE"}catch{Write-Log 'User message unavailable; native restart notification still applies.'}
+    try{$ErrorActionPreference='Continue'; & "$env:SystemRoot\System32\msg.exe" '*' /TIME:2700 $message 2>&1 | Out-Null; Write-Log "User message attempted; exit=$LASTEXITCODE"}catch{Write-Log 'User message unavailable; native restart notification still applies.'}
 }
 function Invoke-Countdown($message) {
     $ErrorActionPreference='Continue'
-    $output=& "$env:SystemRoot\System32\shutdown.exe" /r /t 600 /d p:2:3 /c $message 2>&1
+    $output=& "$env:SystemRoot\System32\shutdown.exe" /r /t 2700 /d p:2:3 /c $message 2>&1
     [pscustomobject]@{Code=$LASTEXITCODE;Text=($output | Out-String)}
 }
 function Request-Reboot($reason,$boot) {
@@ -83,11 +83,11 @@ function Request-Reboot($reason,$boot) {
     if($script:State.RestartBoot -eq $boot){Save-State 'AwaitingRestart' $reason; Write-Log 'Restart already requested this boot; not extending or re-arming it. If cancelled, restart manually.'; return}
     if($script:State.Reboots -ge 3){throw 'Three automatic restart cycles reached. Review servicing logs; further restarts require administrator action.'}
     Save-State 'RebootNeeded' $reason
-    $message="Windows 11 maintenance: this computer will restart in 10 minutes. Save your work; applications will close. $reason"
+    $message="Windows 11 maintenance: this computer will restart in 45 minutes. Save your work; applications will close. $reason"
     $result=Invoke-Countdown $message
     if($result.Code -notin 0,1190){throw "Restart scheduling failed ($($result.Code)): $($result.Text)"}
     $script:State.RestartBoot=$boot; $script:State.Reboots=[int]$script:State.Reboots+1; Save-State 'AwaitingRestart' $reason
-    if($result.Code -eq 0){Invoke-Notice $message; Write-Log 'Restart scheduled in 10 minutes.'}else{Write-Log 'Another restart is already scheduled; its deadline was not changed.'}
+    if($result.Code -eq 0){Invoke-Notice $message; Write-Log 'Restart scheduled in 45 minutes.'}else{Write-Log 'Another restart is already scheduled; its deadline was not changed.'}
 }
 function Get-LauncherText {
     @'
