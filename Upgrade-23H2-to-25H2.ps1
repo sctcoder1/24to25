@@ -41,7 +41,7 @@ $MutexName = 'Global\Win11_23H2_to_25H2_Special'
 
 # Existing proven 24H2 -> 25H2 worker in this same public repository.
 $Existing24to25Uri  = 'https://raw.githubusercontent.com/sctcoder1/24to25/main/Upgrade-25H2.ps1'
-$Existing24to25Hash = 'E953A8856BCAE93B900CC8FF80FE458B6A77F89B06A91E427DD33BE07AC69D97'
+$Existing24to25Hash = '8A1D45268C88DE9A9B37873166DA615A85067AE9AAF9D996FA0770B39A7E13E6'
 
 function Get-OsSnapshot {
     $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
