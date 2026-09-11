@@ -376,11 +376,28 @@ function Mount-AndValidateIso {
         'Education'    { '^Windows 11 Education$' }
         default        { '^$' }
     }
-    $matchingImages = @($images | Where-Object {
-        $_.ImageName -match $editionPattern -and $_.Version -and ([version]$_.Version).Build -eq 26200
-    })
+    # The list form of Get-WindowsImage returns summary objects on some Windows
+    # builds. Those objects have ImageName/ImageIndex but no Version property.
+    # Query matching editions by index to obtain their detailed version data.
+    $editionImages = @($images | Where-Object { $_.ImageName -match $editionPattern })
+    $matchingImages = @()
+    $inspected = @()
+    foreach ($candidate in $editionImages) {
+        $detail = Get-WindowsImage -ImagePath $imagePath -Index ([uint32]$candidate.ImageIndex) -ErrorAction Stop
+        $versionProperty = $detail.PSObject.Properties['Version']
+        if (-not $versionProperty -or -not $versionProperty.Value) {
+            throw "Detailed image metadata for index $($candidate.ImageIndex) does not include a Version value."
+        }
+        $imageVersion = [version][string]$versionProperty.Value
+        $inspected += "$($candidate.ImageName) [$imageVersion]"
+        if ($imageVersion.Build -eq 26200) { $matchingImages += $detail }
+    }
     if (-not $matchingImages.Count) {
-        $available = ($images | ForEach-Object { "$($_.ImageName) [$($_.Version)]" }) -join '; '
+        $available = if ($inspected.Count) {
+            $inspected -join '; '
+        } else {
+            ($images | ForEach-Object { "$($_.ImageName) [index $($_.ImageIndex)]" }) -join '; '
+        }
         throw "Media does not contain the required Windows 11 25H2 build-26200 edition. Available: $available"
     }
     Write-Log "Mounted official Microsoft media at $drive; setup.exe version=$setupVersion, build-26200 edition image found, and Setup signatures are valid."
