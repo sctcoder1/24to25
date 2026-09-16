@@ -69,6 +69,54 @@ function Write-Log([string]$Message) {
     Write-Host $line
 }
 
+function Start-StayAwake {
+    # Keep the computer in the working state while the local SYSTEM worker is
+    # downloading or running Setup. A dedicated helper process owns the power
+    # request so it remains active while this runspace waits for child programs.
+    # The display is intentionally allowed to turn off.
+    $helperTemplate = @'
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class Win10UpgradePowerRequest {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern uint SetThreadExecutionState(uint esFlags);
+}
+"@
+try {
+    $result = [Win10UpgradePowerRequest]::SetThreadExecutionState([uint32]2147483649)
+    if ($result -eq 0) { throw 'SetThreadExecutionState failed.' }
+    Wait-Process -Id __PARENT_PROCESS_ID__ -ErrorAction SilentlyContinue
+} finally {
+    [void][Win10UpgradePowerRequest]::SetThreadExecutionState([uint32]2147483648)
+}
+'@
+    $helperCode = $helperTemplate.Replace('__PARENT_PROCESS_ID__',[string]$PID)
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($helperCode))
+    $powerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $process = Start-Process -FilePath $powerShell -ArgumentList @('-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-EncodedCommand',$encoded) -WindowStyle Hidden -PassThru
+    Start-Sleep -Seconds 1
+    if ($process.HasExited) { throw "Native stay-awake helper exited unexpectedly with code $($process.ExitCode)." }
+    Write-Log "Native stay-awake request enabled (helper PID $($process.Id)); the display may turn off."
+    return $process
+}
+
+function Stop-StayAwake([Diagnostics.Process]$Process) {
+    if (-not $Process) { return }
+    try {
+        if (-not $Process.HasExited) {
+            Stop-Process -Id $Process.Id -Force -ErrorAction Stop
+            $Process.WaitForExit(5000) | Out-Null
+        }
+        Write-Log 'Native stay-awake request released.'
+    } catch {
+        Write-Log "Stay-awake helper cleanup warning: $($_.Exception.Message)"
+    } finally {
+        $Process.Dispose()
+    }
+}
+
 function Get-RunningBuild {
     $text = (& "$env:SystemRoot\System32\cmd.exe" /d /c ver 2>&1 | Out-String)
     $match = [regex]::Match($text,'10\.0\.(\d+)\.')
@@ -218,7 +266,7 @@ function Install-Tasks([string]$SourceFile) {
 
     $action = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\cmd.exe" -Argument '/d /c C:\ProgramData\Win10-22H2-Forced25H2\Win10-22H2-Forced25H2-Launcher.bat'
     $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-    $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([timespan]::Zero)
+    $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -WakeToRun -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([timespan]::Zero)
     Register-ScheduledTask -TaskPath '\' -TaskName $TaskStart -Action $action -Principal $principal -Settings $settings -Trigger (New-ScheduledTaskTrigger -AtStartup) -Force | Out-Null
     $retryTrigger = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(1)) -RepetitionInterval (New-TimeSpan -Hours 3)
     Register-ScheduledTask -TaskPath '\' -TaskName $TaskRetry -Action $action -Principal $principal -Settings $settings -Trigger $retryTrigger -Force | Out-Null
@@ -454,6 +502,7 @@ if ($Install) {
 $mutex = New-Object Threading.Mutex($false,$MutexName)
 $locked = $false
 $state = $null
+$stayAwakeProcess = $null
 try {
     $locked = $mutex.WaitOne(0)
     if (-not $locked) { Write-Output 'Another Windows 10 forced-media worker is already running.'; exit 0 }
@@ -487,6 +536,7 @@ try {
                 Request-Restart -State $state -Reason 'Windows servicing requires a restart before the operating-system upgrade can start.'
                 break
             }
+            $stayAwakeProcess = Start-StayAwake
             Assert-Preflight $os
             Enable-SupportedSetupBypass
             $media = $null
@@ -519,6 +569,7 @@ try {
     Write-Error $_
     exit 1
 } finally {
+    Stop-StayAwake -Process $stayAwakeProcess
     if ($locked) { try { $mutex.ReleaseMutex() } catch {} }
     $mutex.Dispose()
 }
