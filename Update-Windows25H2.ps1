@@ -32,7 +32,9 @@ function Write-Log([string]$Message) {
     Ensure-Root
     $line = '{0} [Current25H2Updates] {1}' -f [datetime]::UtcNow.ToString('o'),$Message
     Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
-    Write-Output $line
+    # Keep log text off the success-output pipeline so helper functions can
+    # return structured objects without their results becoming mixed arrays.
+    Write-Host $line
 }
 
 function Save-State([string]$Phase,[string]$Detail) {
