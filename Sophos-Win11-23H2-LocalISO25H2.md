@@ -1,0 +1,1 @@
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$u='https://raw.githubusercontent.com/sctcoder1/24to25/main/Upgrade-23H2-to-25H2-LocalISO.ps1'; $p=\"$env:TEMP\Upgrade-23H2-to-25H2-LocalISO.ps1\"; Invoke-WebRequest -UseBasicParsing -Uri $u -OutFile $p; & $p -Install"
