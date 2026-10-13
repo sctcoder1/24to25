@@ -1,112 +1,66 @@
-# Direct Windows 11 24H2 to 25H2 deployment
+# Unified Windows 11 25H2 remote upgrade package
 
-This is the **aggressive direct-enablement replacement** for the older offer-based scripts. It installs the released, Microsoft-signed x64 KB5054156 enablement package without waiting for Windows Update to offer 25H2. Use on a backed-up pilot first. Automated regression checks pass; an actual endpoint upgrade has not been performed as part of this code verification.
+Upload this **entire `upgrade25h2` folder** to `sctcoder1/24to25`, branch `main`. These are new files; they do not replace the existing workers or launchers. No repository upload has been performed. Use the GitHub file upload interface or preserve exact bytes with the included `.gitattributes`; browser editor changes and line-ending conversions invalidate the pins.
 
-## What is bypassed, and what is not
+## Deployment
 
-- Explicit `-AllowOfferBypass` authorizes deploying outside Windows Update's feature-offer and safeguard gating. A missing offer is no longer a blocker. This can expose known compatibility problems; a blank local safeguard list is not proof that a device is safe.
-- No safeguard, WSUS, target-release, CPU, TPM, Secure Boot, Defender, or BitLocker policies are changed. Organizational update settings are not deleted. No encryption is suspended.
-- Only regular **x64 Windows 11 24H2 clients**, build 26100, are targeted. Server, ARM64, LTSC and other releases are excluded. Already-running 25H2 is recognized for cleanup. A legacy registry ProductName saying Windows 10 is ignored.
-- Minimum installed 24H2 build remains **26100.5074**. Below that, an applicable current non-preview 24H2 cumulative update is selected from the public **Windows Update service** (`ServerSelection=2`), not the managed WSUS source. A policy or network block on public scans is reported, not silently removed. The worker never treats partial success as successful installation.
-- The enablement package must pass its fixed SHA256 and Microsoft Authenticode checks. DISM retains its applicability checks: no `/IgnoreCheck`. Broken servicing, wrong architecture or an unmet prerequisite cannot be wished away by a force flag.
+1. Review the worker and test on backed-up pilot devices. Escrow BitLocker recovery keys, verify recovery access and endpoint protection compatibility, and confirm the device has AC power. Obtain organizational approval for EULA acceptance and forced closure of unsaved work. Confirm no legacy upgrade worker is running or queued to compete; disable its future triggers through your normal management process, without terminating a running upgrade.
+2. Upload the folder. Both launchers resolve `main` once, fetch the worker from that immutable commit's **raw.githubusercontent.com** URL, verify the exact embedded SHA256, parse it, then call `-Install`. They download only the small worker in the remote session.
+3. TeamViewer: upload `TeamViewer-Deploy25H2.ps1` as a PowerShell remote script and run elevated/as SYSTEM. Sophos Live Response: paste the **entire single line** from `Sophos-Deploy25H2.txt` into CMD. It uses UTF-16LE `EncodedCommand` to avoid CMD quoting/metacharacter problems and stays under CMD's 8191-character limit. Check your Sophos tenant's paste/command-size limit in the pilot.
+4. Success from a launcher means local work was queued, **not that Windows was upgraded**. SYSTEM startup and 30-minute retry tasks run `Upgrade-Unified25H2.ps1` from `%ProgramData%\Unified25H2`. Task execution has no runtime cutoff. Tasks start on AC power; a running task is not stopped when power changes. A helper requests system wakefulness during downloads/installation; closing a lid or explicit sleep can still interrupt work.
 
-Microsoft lists KB5054156 through Windows Update and WSUS, **not as a standalone Microsoft Update Catalog offering**. This deployment uses a separately verified Microsoft delivery-CDN package with DISM; do not mistake it for Microsoft's documented Catalog deployment procedure.
+For local deployment instead of GitHub, run the delivered worker elevated with `-Install`. For status, use `-CheckOnly`; this does not install tasks or run servicing. The worker relaunches through Sysnative when called from 32-bit PowerShell. Worker execution itself requires SYSTEM.
 
-## Sophos: copy the new one-line CMD command
+## Routing and trust checks
 
-The 10-minute deployment ZIP contains only the four files to upload: `Upgrade-25H2.ps1`, `Win11-25H2-Launcher.bat`, `Sophos-Live-Action-One-Liner.txt`, and `README.md`. Optional test, repair and command-generator scripts are developer/support tools, not required deployment files. This version retains the state-save fix. It does not shorten an already scheduled countdown or change an endpoint until redeployed.
+| Detected client release and installed/running build | Action |
+|---|---|
+| Windows 10 22H2 / 19045 | Full Windows 11 25H2 ISO |
+| Windows 11 23H2 / 22631 | Full Windows 11 25H2 ISO |
+| Windows 11 24H2 / 26100 | Direct KB5054156 enablement MSU |
+| Windows 11 25H2 / 26200 | Verify release/kernel/retained source edition; no upgrade or reboot |
+| 22621, other builds, servers, ARM64/x86, inconsistent build/release | Reject; no inferred upgrade path |
 
-**Publishing prerequisite:** these replacement files must first be uploaded to the root of `sctcoder1/24to25`. Repository publishing was blocked in the preparation session. Upload the actual files, not copied/pasted code, to preserve the reviewed bytes. The expected worker SHA256 is `E953A8856BCAE93B900CC8FF80FE458B6A77F89B06A91E427DD33BE07AC69D97`. The command intentionally rejects the old GitHub worker.
+ISO support is deliberately limited to x64, installed UI language en-US, and Home (`Core`), Pro (`Professional`), or Education. Enterprise, N, Single Language and other consumer-media mismatches stop. The ISO must contain exactly one matching x64/en-US edition image at build 26200; that image index is selected explicitly. 35 GB free on the system drive is required. Microsoft signatures on Setup and SetupPrep and a successful native compatibility scan (`0xC1900210`) are mandatory. Scan or install failures require review; no `/product server`, `ignorewarning`, registry TPM/CPU allowance or binary patch is applied. Existing MoSetup/LabConfig bypass configuration blocks the ISO route.
 
-Open [Sophos-Live-Action-One-Liner.txt](Sophos-Live-Action-One-Liner.txt), choose **Raw**, and copy the entire single line into **Sophos Live Action's CMD command**, running elevated/SYSTEM. Do not paste it at a PowerShell prompt. Do not copy Markdown `[url](url)` wrappers. Discard previously saved copies of the old command: their pinned commits still download the old worker.
+Fido 1.70 is pinned to commit `3d47260b8915385c58e20c73e24b36e9a9536f3f` and SHA256 `24C86067FA399D2FD75EF0693A2EC79CA8DB162827F808CAAC03541CBF640C13`. It obtains an official Microsoft x64 English 25H2 ISO URL. **Both** the primary download and the original repository's anonymous SharePoint fallback must match the same ISO SHA256, `768984706B909479417B2368438909440F2967FF05C6A9195ED2667254E465E3`, also listed on [Microsoft's download page](https://www.microsoft.com/en-us/software-download/windows11). Cached bytes are rehashed. Newer/reissued media is rejected until deliberately reviewed and repinned. SharePoint authentication/expiry, SYSTEM proxy restrictions or Fido changes may prevent acquisition; HTML login responses cannot pass the hash.
 
-The supplied command resolves `main` to an immutable commit SHA, downloads that commit's worker into a unique staging filename, verifies the fixed approved SHA256, then calls `-Install -AllowOfferBypass`. Thus a later changed worker will not be executed just because it is on `main`. The verified worker writes its embedded BAT launcher, registers tasks and requests the first run. Sophos does not remain attached to the lengthy update operation. A bootstrap success means the first run was requested, **not** that the upgrade has completed.
+The x64 MSU has the original worker's SHA256 `59A2B315141DA42066183C11F6233D974DE050B41CBB760AAFB8C89B0C88C616`; a valid Microsoft Authenticode signature and expected DISM package identity/state are mandatory. Native DISM applicability checks are retained. 24H2 UBR must be at least 5074, per [KB5054156 prerequisites](https://support.microsoft.com/en-au/servicing/os/windows/docs/2025/02/kb5054156-feature-update-to-windows-11-version-25h2-by-using-an-enablement-package). **Missing cumulative-update prerequisites are now installed automatically** through the native Windows Update Agent. The SYSTEM task searches the configured Windows Update/WSUS source, selects the newest applicable non-preview x64 24H2 cumulative update, downloads and installs it quietly, then requests the guarded two-minute restart when required. Startup/retry tasks recheck the build before enabling 25H2. MSU applies to the existing edition; final verification checks edition preservation.
 
-For a fleet, generate a **fixed-commit command** after publishing, to avoid GitHub's unauthenticated API rate limit on commit discovery. From an elevated or ordinary PowerShell window in this extracted bundle, run `New-SophosCommand.ps1 -Commit` with the actual 40-character GitHub commit SHA containing the uploaded worker. The generator prints a ready CMD line; it does not perform deployment. Copy that output into Sophos. No GitHub token is needed. The public repository and raw-download endpoint must be reachable.
+The cumulative-update search excludes .NET, preview, optional/browse-only, hotpatch, Insider, interactive and dynamic updates. It respects WSUS approvals and update-source policy; it does not switch managed devices to public Windows Update or change policy. Native WUA handles payload trust and prerequisite dependencies, rather than downloading an unpinned CU from an arbitrary URL. The selected CU is dynamic and therefore has no fixed package hash in these launchers; the worker, ISO and enablement MSU retain their pins. Prerequisite installation requires 15 GB free space. No offer, a failed scan/download, disabled services, policy restrictions or blocked network access are reported as `Deferred`, then retried within the existing limits. A partial/failed install or interrupted servicing requires review; the worker never kills the operation or infers restart readiness from failure. After successful CU servicing, the actual build threshold is rechecked; it is never waived. [WUA documentation](https://learn.microsoft.com/en-us/windows/win32/wua_sdk/searching--downloading--and-installing-updates) describes the native update APIs.
 
-```powershell
-# Replace the quoted placeholder with the actual published 40-character commit SHA.
-.\New-SophosCommand.ps1 -Commit 'YOUR_PUBLISHED_40_CHARACTER_COMMIT_SHA'
-```
+## Restarts, recovery and monitoring
 
-The scheduled tasks, in the root Task Scheduler Library, are:
+Setup uses `/noreboot` and is awaited without killing it or its children. A restart needs either a confirmed Windows pending-reboot marker, a native 3010 result, or the installed/pending enablement package. Setup return 0 without a confirmed reboot marker stops for review. The worker checks Setup/servicing processes and system setup flags before restarting. `msg` plus the native shutdown countdown warn users; restart is forced after approximately 120 seconds. The countdown checks every five seconds and cancels if servicing starts or monitoring errors. Servicing and Setup are never terminated. Windows controls its own offline-phase restarts.
 
-| Task | Trigger | Action |
-| --- | --- | --- |
-| `Win11-25H2-AtStartup` | Startup | SYSTEM, highest privileges, BAT launcher |
-| `Win11-25H2-Retry` | Every 3 hours, plus immediate first run | Same BAT launcher |
+Process checks cannot atomically reserve the machine against every other installer starting just before restart. Coordinate patch/upgrade schedules and avoid parallel management agents. Idle TiWorker can conservatively defer work. Do not claim these checks eliminate every possible race or all third-party servicing. Notifications vary with session policies; `msg` is best effort and the Windows shutdown notification is the fallback.
 
-Task-level IgnoreNew and both legacy global mutexes prevent overlapping workers. Tasks run on battery and have no hard execution timeout that could kill servicing. Operations log progress; a prerequisite operation requests soft cancellation after three hours and waits for Windows to stop safely. Transient failures retry at the next trigger.
-
-### Migration from both old scripts
-
-Deploy the new command once; do **not** separately run `Upgrade-24H2-to-25H2.ps1` or schedule it through TeamViewer. That file remains a legacy reference in this repository and is not used by the new deployment.
-
-Installation replaces the two recognized idle tasks above and removes the recognized obsolete `Win11-25H2-Startup` task. It checks task actions before changing them. A name collision or running old task aborts installation: wait for servicing to finish and rerun the bootstrap. It never kills Windows Update, DISM, WUSA, setup or an existing upgrade worker.
-
-Old canonical worker/BAT files are copied into a unique `history-*` directory before replacement. Existing logs, the old `state.json`, the older alternative script, and unrelated `C:\Win11Upgrade` projects are retained. The new worker uses **`direct-state.json`**, so old failure state is not interpreted as new success. No broad folder deletion, Windows Update cache reset or cancellation of someone else's restart is performed.
-
-Re-running the new bootstrap preserves direct-mode state, including reboot limits; it is not a destructive reset. A partial registration failure is logged, preserves the obsolete task, and can be retried after checking the recorded error.
-
-## Restart behavior
-
-- No immediate restart: DISM uses `/Quiet /NoRestart`; successful servicing is followed by a **10-minute** Windows restart countdown, plus a best-effort message to signed-in users. Pending update servicing may also require a 10-minute restart before continuing.
-- **Save work. Windows forcibly closes applications when a timed restart expires**, even without an explicit `/f`. The countdown applies whether or not someone is logged in; this is not a user-consent prompt.
-- An existing system countdown is left unchanged (it may be sooner than 10 minutes). A retry does not extend or re-arm a countdown already recorded for the current boot. If an administrator cancels it with `shutdown /a`, restart manually to continue.
-- At most three automatic restart cycles and two successfully staged enablement attempts are allowed. Failed/partial servicing requiring attention stops automatic installs and restarts; tasks remain to report the condition. This prevents a persistent reboot loop.
-- After a later boot verifies client 25H2/build 26200 and no pending update restart, the worker removes its recognized startup/retry tasks. Script, BAT, logs, package and state remain for audit.
-
-## Check progress on the endpoint
-
-Use an **elevated PowerShell window on the target computer**:
+`state.json` and `worker.log` are under `%ProgramData%\Unified25H2`, restricted to SYSTEM/Administrators. Logs include UTC timestamps. Also inspect `DISM.log`, `CompatLogs.zip`/`SetupLogs.zip` when created, and `C:\$WINDOWS.~BT\Sources\Panther` / rollback logs. Example read-only status:
 
 ```powershell
-Get-Content 'C:\ProgramData\Win11-25H2\Upgrade-25H2.log' -Tail 40
-Get-Content 'C:\ProgramData\Win11-25H2\direct-state.json'
-Get-ScheduledTask -TaskPath '\' -TaskName 'Win11-25H2-*' | Select-Object TaskName,State
+powershell.exe -NoProfile -File "$env:ProgramData\Unified25H2\Upgrade-Unified25H2.ps1" -CheckOnly
+Get-ScheduledTask -TaskName 'Unified25H2-*' | Select-Object TaskName,State
+Get-Content "$env:ProgramData\Unified25H2\worker.log" -Tail 40
 ```
 
-New log lines contain `[Direct25H2]`. Old offer/EulaAccepted errors earlier in the shared log do not describe the new run. For live follow, append `-Wait` to Get-Content; Ctrl+C stops following the log, not the scheduled worker.
+`Complete` means installed release and running kernel are 25H2/26200 and the recorded edition is preserved. Owned tasks are disabled; logs/state/media remain for audit. `Deferred` reports a recoverable pre-install condition. `ManualAttention` disables tasks. Interrupted native/CU work, an unexpected install result, or a reboot that leaves the old release after enablement/Setup (possible rollback) requires operator review. A prerequisite reboot that remains on 24H2 is expected; the task checks UBR and continues. `PrerequisiteSearch`, `PrerequisiteDownload`, `InstallingPrerequisite` and `PrerequisiteComplete` distinguish cumulative-update progress. State records the selected title, prerequisite attempts and an in-flight recovery flag. Corrupt state fails closed rather than resetting counters. Limits: 48 worker entries, two enablement/Setup install attempts, three prerequisite install attempts, three total requested restarts, seven-day deployment age; only one restart request per boot unless the worker safely cancels it. A global mutex protects install and execution across the two tasks.
 
-Expected ready-machine sequence: `Mode=direct` -> package hash/signature verified -> DISM install -> `DISM exit=0` or `3010` -> `AwaitingRestart` -> after restart, `Complete`. `Ready` in Task Scheduler means idle between runs; it is not an upgrade-success verdict. The BAT returns 0 for a successful stage/wait and 1 for a failure; completion is determined by state and the OS after reboot.
+If the previous package was already deployed, the new launcher can replace only its exact known worker hash at an idle pre-install phase (`New`, `Installed`, `Deferred`, `Ready`), with no pending reboot, native upgrade attempt or in-flight CU installation. Running tasks block replacement. Existing state and counters are preserved; missing new prerequisite fields get safe defaults. Unknown/different workers and staged/failed native installs still require explicit operator review. If you already uploaded the original folder, upload **all updated files together**, including both launchers and the hash manifest.
 
-Additional checks:
+To pause, disable both owned tasks without stopping a running instance. Once native servicing has finished and recovery is reviewed, archive the deployment folder and remove only these two tasks before a fresh deployment. Never reset/delete state or kill tasks during Setup/DISM. A cancelled external shutdown does not cause an endless rearm loop; operator review is needed. This package does not remove or rewrite legacy tasks.
 
-```powershell
-Get-Content 'C:\ProgramData\Win11-25H2\Launcher.log' -Tail 30
-Get-ScheduledTask -TaskPath '\' -TaskName 'Win11-25H2-*' | Get-ScheduledTaskInfo | Select-Object LastRunTime,LastTaskResult,NextRunTime
-& 'C:\ProgramData\Win11-25H2\Upgrade-25H2.ps1' -CheckOnly
-```
+## Validation and pilot plan
 
-If bootstrap registration succeeded but the worker failed, inspect `Detail` in `direct-state.json` and the named `DISM-*.log`. Once a transient problem is resolved, request another run:
+Run `Test-Package.ps1` in Windows PowerShell 5.1. It verifies ten routing cases, scalar native exit codes, syntax, launcher pins, decoded Sophos syntax, CMD length and manifest, then runs `Test-Prerequisites.ps1`. The prerequisite suite mocks update sessions/downloads/installations/restarts to test candidate filtering, the automatic CU chain, configured-source policy, quiet installation, no-offer/download failure, partial/interrupted installs, postcondition checks, attempt budgets and already-satisfied prerequisites. It never runs the worker entry point, downloads media, changes tasks or reboots. `Build-Launchers.ps1` regenerates both launchers and the manifest from final worker bytes after deliberate edits; changing repository/folder URLs also requires regenerating them. Review raw downloaded bytes against `SHA256SUMS.txt` after upload.
 
-```powershell
-Start-ScheduledTask -TaskPath '\' -TaskName 'Win11-25H2-Retry'
-```
+Pilot one eligible VM/device per route, including 24H2 below/above UBR 5074 and an already-installed enablement package. Include negative tests for 22621, ARM64, unsupported edition/language, low disk, existing bypass registry, invalid/tampered ISO/MSU/worker, stale pins, invalid signatures, network/proxy failure and expired fallback. Test concurrent launcher/task starts, a running legacy worker, active Setup/TiWorker, missing/corrupt state, native crash, power interruption, reboot rollback, forced countdown notification/cancellation and exhausted budgets. Confirm the remote session exits while local SYSTEM downloads continue, boot/retry triggers work, BitLocker recovery is available, applications/data/edition survive, and completion disables tasks. Do all disruptive tests on disposable backed-up systems; simulated exit codes do not validate real Setup behavior.
 
-Do not blindly delete state to bypass ManualAttention or reboot limits. Investigate the failure/rollback, confirm that no installation is active, and resolve Windows servicing first. Protected deployment files and logs are intentionally writable/readable only by SYSTEM and Administrators.
+Delivered validation: Windows PowerShell 5.1 parser/routing/native-runner/launcher/hash checks and mocked prerequisite regression tests. **No real cumulative update, Windows upgrade, ISO mount, SYSTEM task execution or forced restart was performed here.** Pilot below-threshold 24H2 devices through CU install, restart, UBR verification, enablement, final restart and completion. Also test WSUS unapproved/no-offer conditions, missing checkpoint dependencies, idle/busy WUA installation, CU rollback, interrupted install and migration from the previous worker. The MSU pin is inherited from the reviewed source worker; a local media download could not be independently verified in this environment because the Microsoft download host did not resolve. Runtime hash/signature checks fail closed. Treat the package as a reviewable pilot candidate, not a fleet-certified rollout.
 
-## Verified release payload
+## Known limits and hardware implications
 
-- Download host: `catalog.sf.dl.delivery.mp.microsoft.com` (exact HTTPS URL embedded in worker).
-- Size: 175575 bytes.
-- SHA256: `59A2B315141DA42066183C11F6233D974DE050B41CBB760AAFB8C89B0C88C616`.
-- Authenticode: Valid, signer Microsoft Corporation, checked again on every installation.
-- Manifest: released Feature Update for Windows 11 25H2 via Enablement Package, KB5054156, amd64, version `26100.6717.1.4`.
-- Exact installed package identity: `Package_for_KB5054156~31bf3856ad364e35~amd64~~26100.6717.1.4`.
+Direct enablement deployment bypasses the Windows Update feature offer/rollout gate, while retaining package applicability; that does not establish that a device has no safeguard hold. Review [Windows release health](https://learn.microsoft.com/en-us/windows/release-health/) and your management policies before rollout. Cumulative-update prerequisite servicing is automatic on 24H2. Hardware eligibility, unsupported editions/languages, storage shortages, firmware, broken servicing or blocked update policy still need appropriate remediation; the script does not waive those checks. No update-policy changes, BitLocker suspension override, user deferral, rollback repair or remote notification email is included.
 
-A different Microsoft-signed KB5054156 file labeled Dev Channel Preview was rejected during verification. Do not substitute a similarly named download or weaken hash/signature checks. No MSU is redistributed by this repository; endpoints download directly from Microsoft.
+The original ISO sources used unsupported hardware workarounds. This package omits them. Registry allowances and `/product server` are not a promise of Microsoft support: [unsupported devices may have compatibility problems and are not guaranteed updates, including security updates](https://support.microsoft.com/en-us/windows/experience/compatibility/windows-11-on-devices-that-don-t-meet-minimum-system-requirements). Previously bypassed Windows 11 installs may remain unsupported even when an enablement package is applicable. Do not treat successful DISM/Setup or reaching build 26200 as hardware certification. Review hardware eligibility and recovery plans separately.
 
-## Development verification
-
-State-save hotfix: Windows PowerShell 5.1 converted the original `$null` backup argument to an empty path in File.Replace. The corrected worker uses `[NullString]::Value`. `Test-StatePersistence.ps1` reproduces actual first-write/replacement behavior on disk and verifies the exact repair/backup hashes, without touching servicing or tasks. On an already affected endpoint, run `Repair-25H2-State.ps1` elevated: it patches only the known affected worker, holds both worker mutexes, preserves the previous script, and leaves state/logs/package unchanged. It does not start a task or reboot. After it succeeds, start `Win11-25H2-Retry` to resume normal processing and the delayed restart. For new deployments, upload the corrected worker AND corrected one-liner (its approved hash changed).
-
-`Test-DirectUpgrade.ps1` parses the worker and loads only function definitions. All worker/task/native servicing behavior is mocked; it does not run the entrypoint, install updates, register tasks or restart anything. Run with Windows PowerShell 5.1. If the separately downloaded verification MSU is available locally, the suite additionally verifies its real hash/signature. Tests cover target restrictions, exact task ownership/migration, direct/CU selection, partial failures, interrupt recovery, post-boot completion and countdown bounds. This is not an end-to-end upgrade certification.
-
-## Microsoft references
-
-- [KB5054156 and its prerequisite](https://support.microsoft.com/en-us/servicing/os/windows/docs/2025/02/kb5054156-feature-update-to-windows-11-version-25h2-by-using-an-enablement-package)
-- [DISM package servicing and applicability](https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/dism-operating-system-package-servicing-command-line-options?view=windows-11)
-- [DISM NoRestart](https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/dism-global-options-for-command-line-syntax?view=windows-11)
-- [Safeguard holds and risks of other deployment channels](https://learn.microsoft.com/en-us/windows/deployment/update/safeguard-holds)
-- [Shutdown timeout and forced application closure](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/shutdown)
+Source workers: [Win10 v2](https://github.com/sctcoder1/24to25/blob/main/Upgrade-Win10-22H2-to-Win11-25H2-v2.ps1), [23H2 fallback](https://github.com/sctcoder1/24to25/blob/main/Upgrade-23H2-to-25H2-Forced-SharePointFallback.ps1), [immediate enablement](https://github.com/sctcoder1/24to25/blob/main/Upgrade-25H2-Immediate.ps1). [Microsoft Setup options](https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/windows-setup-command-line-options?view=windows-11) document `/NoReboot` and compatibility scan exit codes.
