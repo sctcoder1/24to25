@@ -162,10 +162,10 @@ function Install-LocalTasks([string]$Source){
         if(Test-Path -LiteralPath $Worker){
             $deployedHash=(Get-FileHash $Worker).Hash; $newHash=(Get-FileHash $Source).Hash
             if($deployedHash -ne $newHash){
-                if($deployedHash -ne 'C1225B47C98780C2EB3C4CEB919AC4A9BACDDB821372705C37B7EACB5114D8FC' -or $script:State.Phase -notin 'New','Installed','Deferred','Ready' -or $script:State.Attempts -ne 0 -or $script:State.PrereqAttempts -ne 0 -or $script:State.Reboots -ne 0 -or $script:State.InstallBoot -or $script:State.PrereqInFlight){throw 'Different deployed worker is outside the reviewed v5 pre-install migration; no replacement attempted'}
+                if(-not (Test-ReviewedWorkerMigration $deployedHash)){throw 'Different deployed worker is outside reviewed v5/v6 pre-install migration; no replacement attempted'}
                 foreach($name in $Tasks){$existing=Get-ScheduledTask -TaskName $name -TaskPath '\' -ErrorAction SilentlyContinue;if($existing -and $existing.State -eq 'Running'){throw 'Existing task is running; retry migration after it finishes'}}
                 Copy-Item -LiteralPath $Source -Destination $Worker -Force
-                Log 'Updated exact v5 worker before any installation/reboot; existing state and servicing retained'
+                Log 'Updated reviewed v5/v6 worker before installation; existing reboot history, state and servicing retained'
             }
         }else{Copy-Item -LiteralPath $Source -Destination $Worker}
         Stage-Launcher
@@ -357,7 +357,10 @@ function Iso-Upgrade($o){
     $lang=(Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls\Language').InstallLanguage
     if($lang -ne '0409'){throw 'ISO requires en-US installed UI language'}
     if((Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$env:SystemDrive'").FreeSpace -lt 35GB){throw '35 GB free space required'}
+    if(-not (Test-IsoReady $o)){return}
+    Log 'Route=ISO: acquiring pinned Windows 11 26H2 English x64 media'
     Acquire-Iso
+    if(-not (Test-IsoReady $o)){return}
     $disk=Mount-DiskImage -ImagePath $Iso -PassThru
     try{
         $vol=$disk|Get-Volume|Where-Object DriveLetter|Select-Object -First 1
@@ -367,7 +370,7 @@ function Iso-Upgrade($o){
         $image=Join-Path $drive 'sources\install.wim'; if(-not(Test-Path $image)){$image=Join-Path $drive 'sources\install.esd'}
         $valid=@(Get-WindowsImage -ImagePath $image|ForEach-Object {Get-WindowsImage -ImagePath $image -Index $_.ImageIndex}|Where-Object {$_.EditionId -eq $o.Edition -and ([version]$_.Version).Build -eq 26300 -and [string]$_.Architecture -in @('9','x64','amd64') -and @($_.Languages) -contains 'en-US'})
         if($valid.Count -ne 1){throw 'Expected exactly one matching x64/en-US edition at build 26300'}
-        if(Busy){throw 'Deferred: native servicing active'}
+        if(-not (Test-IsoReady $o)){return}
         Save 'Scanning' 'Windows Setup compatibility scan'
         $base='/auto upgrade /quiet /eula accept /dynamicupdate enable /noreboot /imageindex '+$valid[0].ImageIndex
         $code=Native $setup ($base+' /compat scanonly /copylogs "'+(Join-Path $Root 'CompatLogs.zip')+'"')
@@ -376,7 +379,8 @@ function Iso-Upgrade($o){
             if($hex -in 'C1900200','C1900204','C1900208','C190020E'){Save 'Deferred' "Compatibility block 0x$hex; next task run will recheck after remediation"}
             throw "Compatibility not approved: 0x$hex"
         }
-        if(Busy){throw 'Deferred: native servicing active after scan'}
+        Save 'Ready' 'ISO compatibility scan passed; rechecking source OS, servicing and reboot requirements'
+        if(-not (Test-IsoReady $o)){return}
         $script:State.Attempts++; $script:State.InstallBoot=$o.Boot; Save 'InstallingISO' 'Online Setup started; interrupted execution requires review'
         $code=Native $setup ($base+' /showoobe none /copylogs "'+(Join-Path $Root 'SetupLogs.zip')+'"')
         if($code -notin 0,3010){
@@ -449,27 +453,72 @@ function Install-OfferedUpdate($session,$chosen,[bool]$Feature,$o){
     if($Feature){Save 'ManualAttention' 'Feature update returned success without restart requirement; inspect logs'; Disable-OwnedTasks}
     elseif((Snapshot).UBR -lt 9711){Save 'ManualAttention' 'Prerequisite did not reach expected October baseline'; Disable-OwnedTasks}
 }
+function Test-ReviewedWorkerMigration([string]$Hash){
+    # Never reset state or replace an installation that may have started.
+    if($script:State.Attempts -ne 0 -or $script:State.PrereqAttempts -ne 0 -or $script:State.InstallBoot -or $script:State.PrereqInFlight){return $false}
+    if($Hash -eq '9BF31597C2D2CD959BDA781325198718C3A15958D93B43F10141066BD558E675'){
+        # A completed pre-upgrade reboot is allowed; preserve its history.
+        return ($script:State.Phase -in 'New','Installed','Deferred','Ready','UpdateSearch','UpdateDownload','PreRebootPending','AwaitingRestart','RestartWarning')
+    }
+    return ($Hash -eq 'C1225B47C98780C2EB3C4CEB919AC4A9BACDDB821372705C37B7EACB5114D8FC' -and $script:State.Reboots -eq 0 -and $script:State.Phase -in 'New','Installed','Deferred','Ready')
+}
+function Assert-NoReportedSafeguard {
+    # Microsoft documents this local indication. Absence is not proof that no
+    # service-side hold exists; media upgrades still need pilot validation.
+    $g=Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Appraiser\GWX' -ErrorAction SilentlyContinue
+    if($g -and $g.PSObject.Properties['GStatus'] -and [string]$g.GStatus -eq '0'){
+        throw 'Deferred: Windows reports an active safeguard hold (GStatus=0); resolve the reported hold before ISO installation'
+    }
+}
+function Test-IsoReady($Before){
+    $now=Snapshot
+    foreach($key in @('Build','Running','Release','Edition','Boot','Architecture','Type')){
+        if($now.$key -ne $Before.$key){throw ('Source OS changed before ISO installation: '+$key+'; retry with a fresh snapshot')}
+    }
+    if(Busy){throw 'Deferred: native servicing active before ISO operation'}
+    Assert-NoReportedSafeguard
+    if(Pending){
+        Save 'Ready' 'Windows now requires a restart before ISO work; using the selected pre-reboot policy'
+        [void](Handle-PreReboot $now)
+        return $false
+    }
+    return $true
+}
 function Msu-Upgrade($o){
     $session=New-Object -ComObject Microsoft.Update.Session
-    $session.ClientApplicationID='Unified26H2-Immediate'; $session.UserLocale=1033
+    $session.ClientApplicationID='Unified26H2'; $session.UserLocale=1033
     $searcher=$session.CreateUpdateSearcher(); $searcher.ServerSelection=0; $searcher.Online=$true
-    Save 'UpdateSearch' 'Searching configured Windows Update/WSUS; no policy or safeguard bypass'
+    Save 'UpdateSearch' 'Searching configured Windows Update/WSUS for 26H2 enablement before choosing ISO'
     $scan=Invoke-PrerequisiteOperation $searcher Search "IsInstalled=0 and IsHidden=0 and Type='Software'"
-    if($scan.ResultCode -ne 2){throw 'Update search incomplete'}
-    if($o.UBR -lt 9711){
-        $candidates=@(for($i=0;$i -lt $scan.Updates.Count;$i++){$u=$scan.Updates.Item($i); if(Test-PrerequisiteCandidate $u){$u}})
-        if(-not $candidates.Count){throw 'October 2026 or later non-preview cumulative update not offered; check update source/approvals'}
-        $chosen=$candidates|Sort-Object LastDeploymentChangeTime -Descending|Select-Object -First 1
-        Install-OfferedUpdate $session $chosen $false $o; return
-    }
-    # Pin the documented KB identity, not a guessed standalone package URL/hash.
+    # A failed/incomplete search is not evidence of an absent offer.
+    if($scan.ResultCode -ne 2){throw 'Update search incomplete; retry search before selecting a method'}
     $candidates=@(for($i=0;$i -lt $scan.Updates.Count;$i++){
         $u=$scan.Updates.Item($i)
         if(@($u.KBArticleIDs) -contains '5121794' -and $u.Title -match '(?i)26H2' -and $u.Title -notmatch '(?i)Preview|Insider' -and -not $u.InstallationBehavior.CanRequestUserInput){$u}
     })
-    if($candidates.Count -ne 1){throw 'Exactly one applicable KB5121794 26H2 enablement offer required; check Windows Update/WSUS approvals, policy and safeguard holds. ISO fallback is not used to bypass an absent offer'}
+    if($candidates.Count -gt 1){throw 'Multiple applicable KB5121794 26H2 offers; review update identities before selecting an update'}
+    if($candidates.Count -eq 0){
+        Save 'Ready' 'Route=ISO: successful update search returned no supported 26H2 enablement offer; selecting validated 26H2 media'
+        Iso-Upgrade $o
+        return
+    }
+    if($o.UBR -lt 9711){
+        $prerequisites=@(for($i=0;$i -lt $scan.Updates.Count;$i++){
+            $u=$scan.Updates.Item($i); if(Test-PrerequisiteCandidate $u){$u}
+        })
+        if(-not $prerequisites.Count){
+            Save 'Ready' 'Route=ISO: enablement prerequisite is below the package baseline and no suitable cumulative update is offered'
+            Iso-Upgrade $o
+            return
+        }
+        $chosen=$prerequisites|Sort-Object LastDeploymentChangeTime -Descending|Select-Object -First 1
+        Install-OfferedUpdate $session $chosen $false $o
+        return
+    }
+    Log 'Route=Enablement: exactly one supported 26H2 offer found and cumulative baseline satisfied'
     Install-OfferedUpdate $session $candidates[0] $true $o
 }
+
 if($CheckOnly){Snapshot|Format-List; if(Test-Path -LiteralPath $StatePath){Get-Content -LiteralPath $StatePath}; exit 0}
 $identity=[Security.Principal.WindowsIdentity]::GetCurrent()
 if(-not ([Security.Principal.WindowsPrincipal]::new($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'Elevation required'}
