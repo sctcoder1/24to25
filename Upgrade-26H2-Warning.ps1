@@ -162,7 +162,10 @@ function Install-LocalTasks([string]$Source){
         if(Test-Path -LiteralPath $Worker){
             $deployedHash=(Get-FileHash $Worker).Hash; $newHash=(Get-FileHash $Source).Hash
             if($deployedHash -ne $newHash){
-                throw 'Different deployed worker exists; review and retire the prior deployment before replacement'
+                if($deployedHash -ne '345B069628CEF6B269CCBFF32135B2E8735D7FECBDB3A1E0EF1FAB571D965599' -or $script:State.Phase -notin 'New','Installed','Deferred','Ready' -or $script:State.Attempts -ne 0 -or $script:State.PrereqAttempts -ne 0 -or $script:State.Reboots -ne 0 -or $script:State.InstallBoot -or $script:State.PrereqInFlight){throw 'Different deployed worker is outside the reviewed v5 pre-install migration; no replacement attempted'}
+                foreach($name in $Tasks){$existing=Get-ScheduledTask -TaskName $name -TaskPath '\' -ErrorAction SilentlyContinue;if($existing -and $existing.State -eq 'Running'){throw 'Existing task is running; retry migration after it finishes'}}
+                Copy-Item -LiteralPath $Source -Destination $Worker -Force
+                Log 'Updated exact v5 worker before any installation/reboot; existing state and servicing retained'
             }
         }else{Copy-Item -LiteralPath $Source -Destination $Worker}
         Stage-Launcher
@@ -174,6 +177,31 @@ function Install-LocalTasks([string]$Source){
         if($script:State.Phase -eq 'New'){Save 'Installed' 'SYSTEM tasks installed'}
         Write-Output 'Local SYSTEM worker queued; starts in about one minute and retries every 30 minutes. Active servicing will be checked by the worker, not the bootstrap'
     
+}
+
+function Handle-PreReboot($o){
+    # Only before our installation has started. Uncertain owned operations retain
+    # their existing recovery/review behavior; a pending flag does not waive it.
+    if($script:State.PrereqInFlight -or $script:State.InstallBoot -or $script:State.Phase -notin 'New','Installed','Deferred','Ready','UpdateSearch','UpdateDownload','PreRebootPending','AwaitingRestart','RestartWarning'){return $false}
+    $pendingNow=Pending
+    if($script:State.PreRebootBoot -and $script:State.PreRebootBoot -ne $o.Boot){
+        if($pendingNow){
+            Save 'ManualAttention' 'Pre-upgrade restart completed but Windows still reports a pending reboot; stopped to prevent a pre-reboot loop'
+            Disable-OwnedTasks
+            return $true
+        }
+        $script:State.PreRebootBoot='';$script:State.RebootBoot='';$script:State.NativeRequiresRestart=$false
+        Save 'Ready' 'Pre-upgrade restart verified; previous Windows reboot requirement cleared'
+        return $false
+    }
+    if(-not $pendingNow){return $false}
+    $reason=Get-BusyReason -ForPreReboot
+    if($reason){Save 'Deferred' ('Pre-reboot required; waiting for '+$reason);return $true}
+    # Persist before shutdown. RebootBoot retains the once-per-boot countdown guard.
+    $script:State.PreRebootBoot=$o.Boot
+    Save 'PreRebootPending' 'Windows required a restart before our upgrade; requests the selected reboot policy and resumes from startup'
+    Restart 'Pre-upgrade restart for an existing Windows reboot requirement' -PreUpgrade
+    return $true
 }
 
 function Snapshot {
@@ -210,9 +238,10 @@ function Test-UpgradeWorkerProcess($Process){
     $path=if($file.Groups[1].Success){$file.Groups[1].Value}else{$file.Groups[2].Value}
     return ([IO.Path]::GetFileName($path) -match '(?i)^(Upgrade-(Unified25H2|26H2|Win10|23H2|25H2).*|Update-Windows25H2.*)\.ps1$')
 }
-function Get-BusyReason {
+function Get-BusyReason([switch]$ForPreReboot) {
     if((New-Object -ComObject Microsoft.Update.Installer).IsBusy){return 'Windows Update reports an active installation'}
     $native=@(Get-Process -Name setup,SetupHost,SetupPrep,dism,wusa,TiWorker -ErrorAction SilentlyContinue)
+    if($ForPreReboot){$native=@($native|Where-Object {$_.ProcessName -ne 'TiWorker'})}
     if($native.Count){return ('Native servicing: '+(($native|ForEach-Object {$_.ProcessName+' PID '+$_.Id}) -join ', '))}
     $setup=Get-ItemProperty 'HKLM:\SYSTEM\Setup'
     foreach($name in @('SystemSetupInProgress','OOBEInProgress')){if($setup.PSObject.Properties[$name] -and [int]$setup.$name -ne 0){return ('Windows Setup flag: '+$name)}}
@@ -276,8 +305,9 @@ function Native([string]$Exe,[string]$Arguments){
     while(-not $p.WaitForExit(30000)){Log "Waiting for native PID $($p.Id); no timeout or termination"}
     $null=$p.WaitForExit(); $code=$p.ExitCode; $p.Dispose(); Log "Native exit: $code"; return $code
 }
-function Restart([string]$Reason){
-    if(Busy){throw 'Deferred: servicing/Setup/older worker active; no restart'}
+function Restart([string]$Reason,[switch]$PreUpgrade){
+    $restartBlock=Get-BusyReason -ForPreReboot:$PreUpgrade
+    if($restartBlock){throw ('Deferred: no restart while '+$restartBlock)}
     if(-not $script:awake){$script:awake=Start-StayAwake}
     $boot=(Snapshot).Boot
     if($script:State.RebootBoot -eq $boot){Save 'AwaitingRestart' 'Restart already requested this boot; operator review if cancelled'; return}
@@ -293,7 +323,7 @@ function Restart([string]$Reason){
     try{
         for($i=0;$i -lt 120;$i++){
             Start-Sleep -Seconds 5
-            if(Busy){
+            if(Get-BusyReason -ForPreReboot:$PreUpgrade){
                 & "$env:SystemRoot\System32\shutdown.exe" /a|Out-Null
                 if($LASTEXITCODE -ne 0){throw 'Restart cancellation failed; immediate operator attention required'}
                 $script:State.RebootBoot=''; Save 'AwaitingRestart' 'Servicing started during countdown; cancelled our restart'; return
@@ -453,12 +483,12 @@ try{
     try{$locked=$mutex.WaitOne(0)}catch [Threading.AbandonedMutexException]{$locked=$true}
     if(-not $locked){Write-Output 'Worker already active; deployment unchanged'; exit 0}
     Ensure-Root
-    $script:State=@{Schema=1;Phase='New';Detail='';UpdatedUtc='';Attempts=0;Runs=0;Reboots=0;RebootBoot='';InstallBoot='';OriginalEdition='';NativeRequiresRestart=$false;CreatedUtc=[datetime]::UtcNow.ToString('o');PrereqAttempts=0;PrereqBoot='';PrereqTitle='';PrereqInFlight=$false;CleanupAttempts=0}
+    $script:State=@{Schema=1;Phase='New';Detail='';UpdatedUtc='';Attempts=0;Runs=0;Reboots=0;RebootBoot='';InstallBoot='';OriginalEdition='';NativeRequiresRestart=$false;CreatedUtc=[datetime]::UtcNow.ToString('o');PrereqAttempts=0;PrereqBoot='';PrereqTitle='';PrereqInFlight=$false;CleanupAttempts=0;PreRebootBoot=''}
     if(Test-Path -LiteralPath $StatePath){
         $loaded=Get-Content -LiteralPath $StatePath -Raw|ConvertFrom-Json
         if($loaded.Schema -ne 1){throw 'State schema invalid; no automatic reset'}
         foreach($key in @($script:State.Keys)){
-            if(-not $loaded.PSObject.Properties[$key]){if($key -in 'PrereqAttempts','PrereqBoot','PrereqTitle','PrereqInFlight','CleanupAttempts'){continue}; throw "State field missing: $key"}
+            if(-not $loaded.PSObject.Properties[$key]){if($key -in 'PrereqAttempts','PrereqBoot','PrereqTitle','PrereqInFlight','CleanupAttempts','PreRebootBoot'){continue}; throw "State field missing: $key"}
             $script:State[$key]=$loaded.$key
         }
     }
@@ -480,6 +510,7 @@ try{
     if($Install){Install-LocalTasks -Source $PSCommandPath; exit 0}
     if($script:State.Phase -in 'Complete','ManualAttention'){exit 0}
     $script:State.Runs++; Save $script:State.Phase 'Worker entered'
+    if(Handle-PreReboot $o){exit 0}
     if(Busy){Save $script:State.Phase ('Waiting; retained recovery phase. '+$script:LastBusyReason); exit 0}
     if($script:State.PrereqInFlight){Save 'ManualAttention' 'Interrupted/partial cumulative-update install; review Windows Update/CBS before resuming'; Disable-OwnedTasks; exit 1}
     # Do not re-run a possibly completed Setup after crash, external reboot, or rollback.
