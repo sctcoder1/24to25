@@ -155,6 +155,27 @@ function Complete-Cleanup {
     Save 'Complete' '26H2 verified; ISO/partial downloads/Fido removed and owned startup/retry tasks unregistered. Temporary power request ends with this worker; no power-plan settings changed'
 }
 
+function Install-LocalTasks([string]$Source){
+        $otherTasks=@(Get-ScheduledTask -ErrorAction Stop|Where-Object {$_.TaskName -like 'Unified26H2-*' -and $_.TaskName -notin $Tasks -and $_.State -ne 'Disabled'})
+        if($otherTasks.Count){throw 'Another 26H2 reboot policy is scheduled; disable its tasks after reviewing state before switching'}
+        foreach($n in $Tasks){Assert-Task $n}
+        if(Test-Path -LiteralPath $Worker){
+            $deployedHash=(Get-FileHash $Worker).Hash; $newHash=(Get-FileHash $Source).Hash
+            if($deployedHash -ne $newHash){
+                throw 'Different deployed worker exists; review and retire the prior deployment before replacement'
+            }
+        }else{Copy-Item -LiteralPath $Source -Destination $Worker}
+        Stage-Launcher
+        $action=New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\cmd.exe" -Argument (Launcher-Arguments)
+        $principal=New-ScheduledTaskPrincipal -UserId SYSTEM -LogonType ServiceAccount -RunLevel Highest
+        $settings=New-ScheduledTaskSettingsSet -WakeToRun -DisallowHardTerminate -AllowStartIfOnBatteries -MultipleInstances IgnoreNew -StartWhenAvailable -ExecutionTimeLimit ([timespan]::Zero) -DontStopIfGoingOnBatteries
+        $triggers=@((New-ScheduledTaskTrigger -AtStartup),(New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 30)))
+        for($i=0;$i -lt 2;$i++){Register-ScheduledTask -TaskName $Tasks[$i] -TaskPath '\' -Action $action -Principal $principal -Settings $settings -Trigger $triggers[$i] -Force|Out-Null}
+        if($script:State.Phase -eq 'New'){Save 'Installed' 'SYSTEM tasks installed'}
+        Write-Output 'Local SYSTEM worker queued; starts in about one minute and retries every 30 minutes. Active servicing will be checked by the worker, not the bootstrap'
+    
+}
+
 function Snapshot {
     $cv=Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
     $os=Get-CimInstance Win32_OperatingSystem
@@ -180,15 +201,40 @@ function Pending {
     if(Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'){return $true}
     return [bool](New-Object -ComObject Microsoft.Update.SystemInfo).RebootRequired
 }
-function Busy {
-    if((New-Object -ComObject Microsoft.Update.Installer).IsBusy){return $true}
-    if(@(Get-Process -Name setup,SetupHost,SetupPrep,dism,wusa,TiWorker -ErrorAction SilentlyContinue).Count){return $true}
-    $s=Get-ItemProperty 'HKLM:\SYSTEM\Setup'
-    foreach($name in @('SystemSetupInProgress','OOBEInProgress')){if($s.PSObject.Properties[$name] -and [int]$s.$name -ne 0){return $true}}
-    # Cooperate with all older workers, even during their downloads.
-    $others=@(Get-CimInstance Win32_Process -Filter "Name='powershell.exe' OR Name='pwsh.exe'"|Where-Object {$_.ProcessId -ne $PID -and $_.CommandLine -match '(?i)(Upgrade-(Unified25H2|26H2|Win10|23H2|25H2)|Update-Windows25H2|Win10UpgradePowerRequest)'})
-    return ($others.Count -gt 0)
+function Test-UpgradeWorkerProcess($Process){
+    $line=[string]$Process.CommandLine
+    $file=[regex]::Match($line,'(?i)(?:^|\s)-(?:File|f)\s+(?:"([^"]+)"|([^\s"]+))')
+    if(-not $file.Success){return $false}
+    $inline=[regex]::Match($line,'(?i)(?:^|\s)-(?:Command|EncodedCommand|c|ec)\b')
+    if($inline.Success -and $inline.Index -lt $file.Index){return $false}
+    $path=if($file.Groups[1].Success){$file.Groups[1].Value}else{$file.Groups[2].Value}
+    return ([IO.Path]::GetFileName($path) -match '(?i)^(Upgrade-(Unified25H2|26H2|Win10|23H2|25H2).*|Update-Windows25H2.*)\.ps1$')
 }
+function Get-BusyReason {
+    if((New-Object -ComObject Microsoft.Update.Installer).IsBusy){return 'Windows Update reports an active installation'}
+    $native=@(Get-Process -Name setup,SetupHost,SetupPrep,dism,wusa,TiWorker -ErrorAction SilentlyContinue)
+    if($native.Count){return ('Native servicing: '+(($native|ForEach-Object {$_.ProcessName+' PID '+$_.Id}) -join ', '))}
+    $setup=Get-ItemProperty 'HKLM:\SYSTEM\Setup'
+    foreach($name in @('SystemSetupInProgress','OOBEInProgress')){if($setup.PSObject.Properties[$name] -and [int]$setup.$name -ne 0){return ('Windows Setup flag: '+$name)}}
+    $ps=@(Get-CimInstance Win32_Process -Filter "Name='powershell.exe' OR Name='pwsh.exe'")
+    # Ignore our process and its directly connected PowerShell ancestors (including
+    # a 32-bit bootstrap that relaunched this worker in native 64-bit PowerShell).
+    $ignored=@([int]$PID);$cursor=[int]$PID
+    for($i=0;$i -lt 16;$i++){
+        $current=$ps|Where-Object {[int]$_.ProcessId -eq $cursor}|Select-Object -First 1
+        if(-not $current){break}
+        $cursor=[int]$current.ParentProcessId
+        if($cursor -in $ignored){break};$ignored+=$cursor
+    }
+    $others=@($ps|Where-Object {[int]$_.ProcessId -notin $ignored -and (Test-UpgradeWorkerProcess $_)})
+    if($others.Count){return ('Other upgrade worker PID(s): '+(($others|ForEach-Object {$_.ProcessId}) -join ', '))}
+    return ''
+}
+function Busy {
+    $script:LastBusyReason=Get-BusyReason
+    return [bool]$script:LastBusyReason
+}
+
 function Launcher-Arguments { '/d /s /c ""'+$Launcher+'""' }
 function Stage-Launcher {
     $source=$LauncherSource
@@ -431,29 +477,10 @@ try{
     }
     if($route -in 'Unsupported','Inconsistent'){throw "Unsupported/inconsistent OS: $($o|ConvertTo-Json -Compress)"}
     if(-not $script:State.OriginalEdition){$script:State.OriginalEdition=$o.Edition}
-    if($Install){
-        $otherTasks=@(Get-ScheduledTask -ErrorAction Stop|Where-Object {$_.TaskName -like 'Unified26H2-*' -and $_.TaskName -notin $Tasks -and $_.State -ne 'Disabled'})
-        if($otherTasks.Count){throw 'Another 26H2 reboot policy is scheduled; disable its tasks after reviewing state before switching'}
-        if(Busy){throw 'Existing upgrade/servicing active; tasks and worker left unchanged'}
-        foreach($n in $Tasks){Assert-Task $n}
-        if(Test-Path -LiteralPath $Worker){
-            $deployedHash=(Get-FileHash $Worker).Hash; $newHash=(Get-FileHash $PSCommandPath).Hash
-            if($deployedHash -ne $newHash){
-                throw 'Different deployed worker exists; review and retire the prior deployment before replacement'
-            }
-        }else{Copy-Item -LiteralPath $PSCommandPath -Destination $Worker}
-        Stage-Launcher
-        $action=New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\cmd.exe" -Argument (Launcher-Arguments)
-        $principal=New-ScheduledTaskPrincipal -UserId SYSTEM -LogonType ServiceAccount -RunLevel Highest
-        $settings=New-ScheduledTaskSettingsSet -WakeToRun -DisallowHardTerminate -AllowStartIfOnBatteries -MultipleInstances IgnoreNew -StartWhenAvailable -ExecutionTimeLimit ([timespan]::Zero) -DontStopIfGoingOnBatteries
-        $triggers=@((New-ScheduledTaskTrigger -AtStartup),(New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 30)))
-        for($i=0;$i -lt 2;$i++){Register-ScheduledTask -TaskName $Tasks[$i] -TaskPath '\' -Action $action -Principal $principal -Settings $settings -Trigger $triggers[$i] -Force|Out-Null}
-        if($script:State.Phase -eq 'New'){Save 'Installed' 'SYSTEM tasks installed'}
-        Write-Output 'Local SYSTEM worker queued; media downloads occur outside this session'; exit 0
-    }
+    if($Install){Install-LocalTasks -Source $PSCommandPath; exit 0}
     if($script:State.Phase -in 'Complete','ManualAttention'){exit 0}
     $script:State.Runs++; Save $script:State.Phase 'Worker entered'
-    if(Busy){Save $script:State.Phase 'Another worker/native servicing active; retained recovery phase'; exit 0}
+    if(Busy){Save $script:State.Phase ('Waiting; retained recovery phase. '+$script:LastBusyReason); exit 0}
     if($script:State.PrereqInFlight){Save 'ManualAttention' 'Interrupted/partial cumulative-update install; review Windows Update/CBS before resuming'; Disable-OwnedTasks; exit 1}
     # Do not re-run a possibly completed Setup after crash, external reboot, or rollback.
     if($script:State.InstallBoot -and $script:State.InstallBoot -ne $o.Boot){Save 'ManualAttention' 'Upgrade attempt crossed reboot without target verification; possible rollback'; Disable-OwnedTasks; exit 1}
