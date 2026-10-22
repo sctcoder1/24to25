@@ -162,10 +162,10 @@ function Install-LocalTasks([string]$Source){
         if(Test-Path -LiteralPath $Worker){
             $deployedHash=(Get-FileHash $Worker).Hash; $newHash=(Get-FileHash $Source).Hash
             if($deployedHash -ne $newHash){
-                if(-not (Test-ReviewedWorkerMigration $deployedHash)){throw 'Different deployed worker is outside reviewed v5/v6 pre-install migration; no replacement attempted'}
+                if(-not (Test-ReviewedWorkerMigration $deployedHash)){throw 'Different deployed worker is outside reviewed v5/v6/v7/v8 pre-install migration; no replacement attempted'}
                 foreach($name in $Tasks){$existing=Get-ScheduledTask -TaskName $name -TaskPath '\' -ErrorAction SilentlyContinue;if($existing -and $existing.State -eq 'Running'){throw 'Existing task is running; retry migration after it finishes'}}
                 Copy-Item -LiteralPath $Source -Destination $Worker -Force
-                Log 'Updated reviewed v5/v6 worker before installation; existing reboot history, state and servicing retained'
+                Log 'Updated reviewed v5/v6/v7/v8 worker before installation; existing reboot history, state and servicing retained'
             }
         }else{Copy-Item -LiteralPath $Source -Destination $Worker}
         Stage-Launcher
@@ -349,9 +349,13 @@ function Acquire-Iso {
     }catch{Log ('Primary ISO failed: '+$_.Exception.Message); Download $Fallback $Iso $IsoHash}
 }
 function Iso-Upgrade($o){
+    # v9 unsupported-hardware attempt: honor existing configuration, without
+    # changing registry values, deleting appraiser data or modifying media.
     $bypass=Get-ItemProperty 'HKLM:\SYSTEM\Setup\MoSetup' -ErrorAction SilentlyContinue
-    if($bypass -and $bypass.PSObject.Properties['AllowUpgradesWithUnsupportedTPMOrCPU'] -and $bypass.AllowUpgradesWithUnsupportedTPMOrCPU -ne 0){throw 'Existing unsupported TPM/CPU allowance detected; remove through an approved remediation before deployment'}
-    if(Test-Path 'HKLM:\SYSTEM\Setup\LabConfig'){throw 'Existing LabConfig bypass configuration; operator review required'}
+    if($bypass -and $bypass.PSObject.Properties['AllowUpgradesWithUnsupportedTPMOrCPU'] -and $bypass.AllowUpgradesWithUnsupportedTPMOrCPU -ne 0){
+        Log ('Unsupported-hardware attempt: honoring existing AllowUpgradesWithUnsupportedTPMOrCPU='+$bypass.AllowUpgradesWithUnsupportedTPMOrCPU+'; installer hard limits can still apply')
+    }
+    if(Test-Path 'HKLM:\SYSTEM\Setup\LabConfig'){Log 'Existing LabConfig retained; its presence does not establish that an in-place upgrade can bypass hardware requirements'}
     if($o.Edition -notin @('Professional','Core','Education')){throw 'Consumer ISO edition unsupported'}
     # Installed UI language, not keyboard/system locale, must match media.
     $lang=(Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls\Language').InstallLanguage
@@ -372,7 +376,7 @@ function Iso-Upgrade($o){
         if($valid.Count -ne 1){throw 'Expected exactly one matching x64/en-US edition at build 26300'}
         if(-not (Test-IsoReady $o)){return}
         Save 'Scanning' 'Windows Setup compatibility scan'
-        $base='/auto upgrade /quiet /eula accept /dynamicupdate enable /noreboot /imageindex '+$valid[0].ImageIndex
+        $base='/auto upgrade /quiet /eula accept /compat ignorewarning /dynamicupdate enable /noreboot /imageindex '+$valid[0].ImageIndex
         $code=Native $setup ($base+' /compat scanonly /copylogs "'+(Join-Path $Root 'CompatLogs.zip')+'"')
         $hex=[BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$code),0).ToString('X8')
         if($hex -ne 'C1900210'){
@@ -456,7 +460,7 @@ function Install-OfferedUpdate($session,$chosen,[bool]$Feature,$o){
 function Test-ReviewedWorkerMigration([string]$Hash){
     # Never reset state or replace an installation that may have started.
     if($script:State.Attempts -ne 0 -or $script:State.PrereqAttempts -ne 0 -or $script:State.InstallBoot -or $script:State.PrereqInFlight){return $false}
-    if($Hash -eq '9BF31597C2D2CD959BDA781325198718C3A15958D93B43F10141066BD558E675'){
+    if($Hash -in '9BF31597C2D2CD959BDA781325198718C3A15958D93B43F10141066BD558E675','CD6D8F63B5E7437B57FFD9F0EA4B95533F850F5DFE9BD4854D83C8886FAB9BE6'){
         # A completed pre-upgrade reboot is allowed; preserve its history.
         return ($script:State.Phase -in 'New','Installed','Deferred','Ready','UpdateSearch','UpdateDownload','PreRebootPending','AwaitingRestart','RestartWarning')
     }
